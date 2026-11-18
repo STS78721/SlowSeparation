@@ -1,6 +1,29 @@
 # Changelog
 
-All notable changes to the **SteelTempSaint Donkey Kong Bananza PC Recomp (DKB)** project are documented in this file.
+All notable changes to **FF-SlowSeparation** (SteelTemple, Fast Fusion PC) are documented in this file. Older entries
+below come from the shared Universal NS2 to PC history this project is built on.
+
+---
+
+## [Alpha 0.1.0a] - 2026-11-19
+
+### 🏁 First SteelTemple SlowSeparation release (Fast Fusion 1.0.0)
+- **Native 1:1 rendering up to 4K:** the Fast Fusion resolution hooks (`runtime/resolution.c`) set the canvas,
+  lock the race camera's frame-buffer scale to 1.0, lift the scene render targets, and keep the DLSS pass at 1:1, so a
+  race renders at Original, 720p, 900p, 1080p, 1440p (2560x1440), or 2160p (4K) instead of the console's half size.
+- **Black sky fixed at 1:1:** the texture cache keyed an unset depth-stencil mode apart from an explicit DEPTH, so the
+  sky shader read `RenderQueue_DepthCopy` through a second, never-written image (`runtime/vk_texture.c` `make_key`).
+  An unset mode now keys as DEPTH, as `nvnTextureGetDepthStencilMode` reports it.
+- **SteelTemple SlowSeparation F1 menu:** the Switch-2-style settings overlay with the new default theme (midnight
+  indigo, hot-magenta and cyan neon, speed streaks, an anti-grav racer emblem), Light and Dark themes, an Internal
+  resolution row with 1440p and 2160p, and anisotropic filtering (`NS2_ANISO`, default 16x).
+- **FFLauncher, Setup Wizard, portable and update packages:** verify a Fast Fusion 1.0.0 dump by SHA-256 (all six
+  ExeFS modules), pack RomFS, lift ARM64 to C, and build `ff.exe` locally with the bundled LLVM-MinGW, Ninja and
+  Python; GitHub Releases update checks; desktop and Start-menu shortcuts.
+- **Shader pre-warm step (setup 5/5):** after building `ff.exe`, FFLauncher runs `tools/prepare_shaders.py`, which
+  seeds every shader of the dump and runs `ff.exe --prepare-shaders` to translate them and build their pipeline
+  libraries once (the MKW-THWOMP warm step, done through this runtime's prepare mode); it runs again after an update.
+- **Original icons:** `tools/make_ff_icons.py` draws the SlowSeparation icon set; no game artwork is used.
 
 ---
 

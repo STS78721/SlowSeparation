@@ -1,0 +1,5 @@
+/* SteelTemple SlowSeparation: the application manifest of ff.exe (ff.manifest) and its icon (ff.ico, drawn by
+   tools/make_ff_icons.py; also the icon of the setup wizard and the installer window). tools/build_game.py compiles it
+   with the runtime objects instead of totk.rc when the executable is ff.exe. */
+1 24 "ff.manifest"
+1 ICON "ff.ico"

@@ -1861,9 +1861,20 @@ static VkSampler make_sampler(VkCtx *c, const samp_par *d) {
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
     float lim = c->props.limits.maxSamplerLodBias;
     si.mipLodBias = fmaxf(-lim, fminf(lim, d->lod_bias));
-    if (d->aniso > 1) {
+    // NS2_ANISO=N (Graphics, default 16): floor anisotropic filtering on mipmapped linear-min samplers so angled
+    // track surfaces keep their detail; "game" keeps the title's own value.
+    static float aniso_min = -1.f;
+    if (aniso_min < 0.f) {
+        const char *av = cfg_value("NS2_ANISO");
+        aniso_min = (av && strcmp(av, "game")) ? (float)atof(av) : 0.f;
+        if (aniso_min > 1.f) rt_log("vk: anisotropic filtering at least %gx (NS2_ANISO)", (double)aniso_min);
+    }
+    float aniso = d->aniso;
+    if (mf >= NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST && si.minFilter == VK_FILTER_LINEAR && aniso < aniso_min)
+        aniso = aniso_min;
+    if (aniso > 1.f) {
         si.anisotropyEnable = VK_TRUE;
-        si.maxAnisotropy = fminf(d->aniso, c->props.limits.maxSamplerAnisotropy);
+        si.maxAnisotropy = fminf(aniso, c->props.limits.maxSamplerAnisotropy);
     }
     if (d->cmp_mode) {
         si.compareEnable = VK_TRUE;

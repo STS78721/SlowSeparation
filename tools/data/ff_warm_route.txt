@@ -1,0 +1,17 @@
+# FF SlowSeparation shader warm route (runtime/input.c TOTK_INPUT_SCRIPT format: "@<ms> <button> [hold ms]").
+# FFLauncher's setup step 5 runs ff.exe once with this script on a scratch profile: it pages through the title and
+# the race menus into the first race and holds accelerate, so the shaders of the menus, the vehicle and the first
+# track are met, recorded (shader-programs.bin, shader-answers.bin) and then built by ff.exe --prepare-shaders.
+# Button presses only; no game data.
+@2500 L 250
+@2500 R 250
+@3500 L 250
+@3500 R 250
+@4500 A 150
+@5500 A 150
+@6500 A 150
+@7500 A 150
+@8500 A 150
+@9500 A 150
+@10500 A 150
+@12000 A 16000

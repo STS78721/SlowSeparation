@@ -150,7 +150,8 @@ WINDRES = UCRT / 'windres.exe'   # runtime/totk.rc: the manifest of totk.exe
 TOOLCHAIN_BIN = None   # llvm-mingw bin directory, set by main() for --toolchain
 DEPS = None            # the deps directory of an llvm-mingw build
 # tools/data/expected-<display version>.json for each build version name.
-DISPLAY_VERSIONS = {'v0': '1.0.0', 'v111': '1.1.1', 'v112': '1.1.2', 'v121': '1.2.1', 'v143': '1.4.3', 'mtf111': '1.1.1', 'mkw180': '1.8.0'}
+DISPLAY_VERSIONS = {'v0': '1.0.0', 'v111': '1.1.1', 'v112': '1.1.2', 'v121': '1.2.1', 'v143': '1.4.3', 'mtf111': '1.1.1', 'mkw180': '1.8.0',
+                    'ff100': '1.0.0'}
 
 GiB = 1 << 30
 # Peak commit of one compile, 1.2.1 at -O1 (2026-10-20): 120-180 MiB per ~3 MiB chunk, 568 MiB for main_table.c
@@ -254,7 +255,7 @@ def other_os(name):
     stem = name.rsplit('.', 1)[0]
     if WIN:
         return stem.endswith('_sdl') or name == 'linux.c'
-    return stem.endswith('_win') or name in ('win32.c', 'totk.rc')
+    return stem.endswith('_win') or name == 'win32.c' or name.endswith('.rc')
 
 
 def runtime_sources(skip=()):
@@ -298,25 +299,27 @@ def module_glue(layout, linked, hashes, paths, version, title_id=0x040074a01bf12
     out += ['};', f'const int rt_exefs_sha256_count = {len(hashes)};', '']
     for name in ('exefs', 'romfs', 'profile'):
         out.append(f'const char rt_default_{name}[] = {c_string(paths[name].as_posix())};')
-    if any(k in version.lower() for k in ('mtf', 'mkw', 'dkb', 'oot')):
+    disp_ver = DISPLAY_VERSIONS.get(version, '')
+    if any(k in version.lower() for k in ('mtf', 'mkw', 'dkb', 'oot', 'ff')):
         number = 0
     else:
         number = int(DISPLAY_VERSIONS[version].replace('.', '')) if version in DISPLAY_VERSIONS else 0   # 1.4.3 -> 143
     out += [f'const uint64_t rt_application_id = {title_id:#x}ull;',
             f'const int rt_game_version = {number};',
             f'const char rt_port_version[] = {c_string(port_version())};',
+            f'const char rt_game_display_version[] = {c_string(disp_ver)};',
             f'const char rt_game_short_name[] = {c_string(short_name)};',
             f'const char rt_game_display_name[] = {c_string(display_name)};', '']
     return '\n'.join(out)
 
 
 def port_version():
-    """VERSION at the root: the repository's semver, or in a release folder the release string (make_release.py
-    version). A build from a git checkout appends the short commit, as a release does, so the settings menu says which
-    commit a report came from."""
+    """The first line of VERSION at the root (e.g. 'Alpha 0.1.0'), shown by the launcher, setup and F1 menu. A build
+    from a git checkout of a plain semver appends the short commit, so a report says which commit it came from."""
     path = ROOT / 'VERSION'
-    version = path.read_text(encoding='utf-8').strip() if path.is_file() else 'unknown'
-    if '+' not in version and (ROOT / '.git').exists():
+    text = path.read_text(encoding='utf-8-sig').strip() if path.is_file() else ''
+    version = text.splitlines()[0].strip() if text else 'unknown'
+    if ' ' not in version and '+' not in version and (ROOT / '.git').exists():
         try:
             commit = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', '--short=7', 'HEAD'], capture_output=True,
                                     text=True, timeout=10).stdout.strip()
@@ -414,11 +417,14 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         sources = [p for p in sources if p.name in INSTALL_SIDE] + [out / 'modules.c']
     else:
         sources += [out / 'modules.c']
+    # One resource script per game: runtime/<exe stem>.rc (its icon and manifest) when it exists, else totk.rc.
+    want_rc = f'{Path(EXE).stem}.rc' if (RUNTIME / f'{Path(EXE).stem}.rc').is_file() else 'totk.rc'
+    sources = [p for p in sources if p.suffix != '.rc' or p.name == want_rc]
     for src in sources:
         o = runtime_object(out, src)
-        if src.suffix == '.rc':   # windres writes no depfile: the files totk.rc embeds are listed by hand
-            lines.append(f'build {ninja_path(o)}: rc {ninja_path(src)} | {ninja_path(RUNTIME / "totk.manifest")} '
-                         f'{ninja_path(RUNTIME / "totk.ico")}')
+        if src.suffix == '.rc':   # windres writes no depfile: the manifest and icon the script embeds are listed by hand
+            lines.append(f'build {ninja_path(o)}: rc {ninja_path(src)} | {ninja_path(RUNTIME / f"{src.stem}.manifest")} '
+                         f'{ninja_path(RUNTIME / f"{src.stem}.ico")}')
         else:
             lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(src)}')
             if src.suffix == '.cpp':   # the Ampere lowering headers (runtime/third_party/eglantine) need C++20
