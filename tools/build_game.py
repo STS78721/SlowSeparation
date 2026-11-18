@@ -354,9 +354,13 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         ldflags.append('-Wl,--wrap,f_70001a6e80')
         ldflags.append('-Wl,--wrap,f_7000192d60')
     if 'ff' in str(out).lower() or 'ff' in str(gen).lower():
-        ldflags.append('-Wl,--wrap,f_700011ff04')
-        ldflags.append('-Wl,--wrap,f_700011ff1c')
-        ldflags.append('-Wl,--wrap,f_7000075cc0')
+        for sym in (
+            'f_700011ff04', 'f_700011ff1c', 'f_700011fde4',
+            'f_700006ec74', 'f_70000f0960',
+            'f_70001080b0', 'f_7000108170',
+            'f_700002c764',
+        ):
+            ldflags.append(f'-Wl,--wrap,{sym}')
     lines = [
         '# Written by tools/build_game.py; do not edit.',
         'ninja_required_version = 1.10',

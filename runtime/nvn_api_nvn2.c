@@ -303,20 +303,29 @@ NVN_API(nvnDlssNetworkBuilderSetOutputResolution) {
     dlss_builder_t *b = dlss_builder_of(arg_p(c, 0), 0);
     uint32_t in_w = (uint32_t)arg_x(c, 1);
     uint32_t in_h = (uint32_t)arg_x(c, 2);
-    uint32_t cw = 0, ch = 0;
-    ff_get_target_resolutions(&cw, &ch, NULL, NULL);
-    if (b) {
-        b->out_w = (cw > 0) ? cw : in_w;
-        b->out_h = (ch > 0) ? ch : in_h;
+    uint32_t out_w = in_w, out_h = in_h;
+    if (res_ff_enabled()) {
+        uint32_t cw = 0, ch = 0;
+        ff_get_target_resolutions(&cw, &ch, NULL, NULL);
+        if (cw > 0) out_w = cw;
+        if (ch > 0) out_h = ch;
     }
-    rt_log("dlss: SetOutputResolution %ux%u -> %ux%u (lr=%#llx)", in_w, in_h, b ? b->out_w : 0, b ? b->out_h : 0, (unsigned long long)c->x[30]);
+    if (b) {
+        b->out_w = out_w;
+        b->out_h = out_h;
+    }
+    rt_log("dlss: SetOutputResolution %ux%u -> %ux%u (lr=%#llx)", in_w, in_h, b ? b->out_w : out_w, b ? b->out_h : out_h, (unsigned long long)c->x[30]);
 }
 NVN_API(nvnDlssNetworkBuilderGetOutputResolution) {
     dlss_builder_t *b = dlss_builder_of(arg_p(c, 0), 0);
-    uint32_t cw = 0, ch = 0;
-    ff_get_target_resolutions(&cw, &ch, NULL, NULL);
-    uint32_t w = (b && b->out_w) ? b->out_w : cw;
-    uint32_t h = (b && b->out_h) ? b->out_h : ch;
+    uint32_t w = b ? b->out_w : 0;
+    uint32_t h = b ? b->out_h : 0;
+    if (res_ff_enabled() && (!w || !h)) {
+        uint32_t cw = 0, ch = 0;
+        ff_get_target_resolutions(&cw, &ch, NULL, NULL);
+        if (!w) w = cw;
+        if (!h) h = ch;
+    }
     dlss_write_u32(c, 1, w);
     dlss_write_u32(c, 2, h);
 }
@@ -326,12 +335,16 @@ NVN_API(nvnDlssNetworkBuilderSetPreset) { dlss_builder_t *b = dlss_builder_of(ar
 NVN_API(nvnDlssNetworkBuilderGetPreset) { dlss_builder_t *b = dlss_builder_of(arg_p(c, 0), 0); ret_x(c, b ? b->preset : 0); }
 NVN_API(nvnDlssNetworkBuilderGetOptimalSettings) {
     dlss_builder_t *b = dlss_builder_of(arg_p(c, 0), 0);
-    uint32_t cw = 0, ch = 0, sw = 0, sh = 0;
-    ff_get_target_resolutions(&cw, &ch, &sw, &sh);
-    uint32_t w = (sw > 0) ? sw : ((b && b->out_w) ? b->out_w : 1920u);
-    uint32_t h = (sh > 0) ? sh : ((b && b->out_h) ? b->out_h : 1080u);
+    uint32_t w = (b && b->out_w) ? b->out_w : 1920u;
+    uint32_t h = (b && b->out_h) ? b->out_h : 1080u;
+    if (res_ff_enabled()) {
+        uint32_t cw = 0, ch = 0, sw = 0, sh = 0;
+        ff_get_target_resolutions(&cw, &ch, &sw, &sh);
+        if (sw > 0) w = sw;
+        if (sh > 0) h = sh;
+    }
     rt_log("dlss: GetOptimalSettings out=%ux%u optimal_scene=%ux%u method=%u preset=%u (lr=%#llx)",
-           b ? b->out_w : cw, b ? b->out_h : ch, w, h, b ? b->method : 0, b ? b->preset : 0, (unsigned long long)c->x[30]);
+           b ? b->out_w : 0, b ? b->out_h : 0, w, h, b ? b->method : 0, b ? b->preset : 0, (unsigned long long)c->x[30]);
     dlss_write_u32(c, 1, w);
     dlss_write_u32(c, 2, h);
     dlss_write_u32(c, 3, w);
@@ -447,17 +460,29 @@ NVN_API(nvnCommandBufferEvaluateDlss) {
     dlss_net_t *n = dlss_net_of(arg_p(c, 1), 0);
     dlss_params_t *p = dlss_params_of(arg_p(c, 2), 0);
     if (!cmd || !p || !p->in_color.tex || !p->out_color.tex) return;
+    uint32_t in_w = p->in_w, in_h = p->in_h;
+    if ((!in_w || !in_h) && plat_mem_readable((uintptr_t)p->in_color.tex, sizeof(tex_t))) {
+        const tex_t *t = (const tex_t *)p->in_color.tex;
+        if (!in_w) in_w = (uint32_t)t->d.width;
+        if (!in_h) in_h = (uint32_t)t->d.height;
+    }
+    uint32_t out_w = n ? n->out_w : 0, out_h = n ? n->out_h : 0;
+    if ((!out_w || !out_h) && plat_mem_readable((uintptr_t)p->out_color.tex, sizeof(tex_t))) {
+        const tex_t *t = (const tex_t *)p->out_color.tex;
+        if (!out_w) out_w = (uint32_t)t->d.width;
+        if (!out_h) out_h = (uint32_t)t->d.height;
+    }
     static int logged = 0;
     if (!logged) {
         logged = 1;
-        rt_log("dlss: EvaluateDlss in=(%d,%d %dx%d) out=(%d,%d %dx%d)",
-               (int)p->in_color_x, (int)p->in_color_y, (int)p->in_w, (int)p->in_h,
-               (int)p->out_x, (int)p->out_y, n ? (int)n->out_w : 0, n ? (int)n->out_h : 0);
+        rt_log("dlss: EvaluateDlss in=(%d,%d %ux%u) out=(%d,%d %ux%u)",
+               (int)p->in_color_x, (int)p->in_color_y, in_w, in_h,
+               (int)p->out_x, (int)p->out_y, out_w, out_h);
     }
     nvn_cmd_copy_tex_blit(cmd, p->in_color.tex, p->in_color.view,
-                          (int)p->in_color_x, (int)p->in_color_y, (int)p->in_w, (int)p->in_h,
+                          (int)p->in_color_x, (int)p->in_color_y, (int)in_w, (int)in_h,
                           p->out_color.tex, p->out_color.view,
-                          (int)p->out_x, (int)p->out_y, n ? (int)n->out_w : 0, n ? (int)n->out_h : 0);
+                          (int)p->out_x, (int)p->out_y, (int)out_w, (int)out_h);
 }
 NVN2_NOT_RECORDED(nvnCommandBufferInsertDebugMarkerCompute)
 NVN2_NOT_RECORDED(nvnCommandBufferInsertDebugMarkerGraphics)

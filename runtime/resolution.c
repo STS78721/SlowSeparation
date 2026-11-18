@@ -27,6 +27,7 @@
 // rewritten table (res_heapdef_build) in place of the original; memory.c adds the amount to the application pool, so
 // no other heap shrinks. Without the rewritten table (a RomFS that lacks it, a format this code does not know) the
 // patch sets stay off and the game keeps its own sizes.
+#include <ctype.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -37,6 +38,7 @@
 #include "cfg.h"
 #include "game_profile.h"
 #include "host.h"
+#include "platform/platform.h"
 
 #define BASE_W 1920
 #define BASE_H 1080
@@ -232,6 +234,12 @@ static uint64_t pack(unsigned w, unsigned h) { return (uint64_t)h << 32 | w; }
 void res_init(void) {
     if (!game_profile_has(GAME_QUIRK_TOTK_PATCH_RES)) {
         const RtGameProfile *gp = game_profile();
+        if (res_ff_enabled()) {
+            uint32_t cw = 0, ch = 0, sw = 0, sh = 0;
+            ff_get_target_resolutions(&cw, &ch, &sw, &sh);
+            rt_log("resolution: Fast Fusion resolution hooks active (Canvas %ux%u, Scene %ux%u)", cw, ch, sw, sh);
+            return;
+        }
         rt_log("resolution: Universal NS2 live hooks active for %s (Docked %ux%u, Handheld %ux%u)",
                gp->display_name, gp->docked_w, gp->docked_h, gp->handheld_w, gp->handheld_h);
         return;
@@ -321,11 +329,27 @@ void res_fov_live(void) {
 }
 
 void res_wanted(unsigned out[2]) {
+    if (res_ff_enabled()) {
+        uint32_t cw = 0, ch = 0;
+        ff_get_target_resolutions(&cw, &ch, NULL, NULL);
+        out[0] = cw;
+        out[1] = ch;
+        return;
+    }
     decide();
     out[0] = R.ow, out[1] = R.oh;
 }
 
 void res_sizes(unsigned out[2], unsigned scene[2]) {
+    if (res_ff_enabled()) {
+        uint32_t cw = 0, ch = 0, sw = 0, sh = 0;
+        ff_get_target_resolutions(&cw, &ch, &sw, &sh);
+        out[0] = cw;
+        out[1] = ch;
+        scene[0] = sw;
+        scene[1] = sh;
+        return;
+    }
     decide();
     out[0] = R.ow ? R.ow : BASE_W;
     out[1] = R.oh ? R.oh : BASE_H;
@@ -396,57 +420,114 @@ void res_live_snapshot(unsigned win_sz[2], unsigned crop_sz[2], unsigned out_tgt
 }
 
 // ---- Fast Fusion Resolution Scaling Hooks
-// Fast Fusion uses a Display/Configuration singleton at *(uint64_t*)0x700071beb8.
-// - f_700011ff04 sets the Output Canvas resolution (shipped 3840x2160 docked, 1920x1080 handheld)
-// - f_700011ff1c sets the Internal 3D scene rendering resolution (shipped 1920x1080 docked, 1280x720 handheld)
-// - f_7000075cc0 sets the dynamic sub-viewport projection scale (1.0 = full render target)
+// Configuration priority: TOTK_RESOLUTION -> TOTK_OUTPUT_RES -> game_profile() (1920x1080 docked, 1280x720 handheld);
+// TOTK_RENDER_SCALE="game" defaults 1:1. TOTK_RES_HOOK=0 bypasses all hooks.
 extern void __real_f_700011ff04(Cpu *c) __attribute__((weak));
 extern void __real_f_700011ff1c(Cpu *c) __attribute__((weak));
-extern void __real_f_7000075cc0(Cpu *c) __attribute__((weak));
+extern void __real_f_700011fde4(Cpu *c) __attribute__((weak));
+extern void __real_f_700006ec74(Cpu *c) __attribute__((weak));
+extern void __real_f_70000f0960(Cpu *c) __attribute__((weak));
+extern void __real_f_70001080b0(Cpu *c) __attribute__((weak));
+extern void __real_f_7000108170(Cpu *c) __attribute__((weak));
+extern void __real_f_700002c764(Cpu *c) __attribute__((weak));
+
+int res_ff_enabled(void) {
+    const RtGameProfile *gp = game_profile();
+    return gp && gp->short_name && !strcmp(gp->short_name, "ff") && cfg_bool("TOTK_RES_HOOK");
+}
+
+static int ff_streqi(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+    }
+    return *a == *b;
+}
+
+static int ff_strcasestr(const char *hay, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (!nlen) return 1;
+    for (; *hay; hay++) {
+        size_t i = 0;
+        while (i < nlen && hay[i] && tolower((unsigned char)hay[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == nlen) return 1;
+    }
+    return 0;
+}
+
+static int ff_parse_resolution(const char *s, uint32_t *out_w, uint32_t *out_h) {
+    if (!s || !*s) return 0;
+    if (ff_streqi(s, "original") || ff_streqi(s, "default") || ff_streqi(s, "game")) return 0;
+    if (ff_streqi(s, "4k")) {
+        *out_w = 3840u;
+        *out_h = 2160u;
+        return 1;
+    }
+    unsigned w = 0, h = 0;
+    char tail = 0;
+    if (sscanf(s, "%ux%u%c", &w, &h, &tail) == 2 && w >= 640u && h >= 360u && w <= 16384u && h <= 16384u) {
+        *out_w = w & ~1u;
+        *out_h = h & ~1u;
+        return 1;
+    }
+    char *end = NULL;
+    unsigned long val = strtoul(s, &end, 10);
+    if (end != s && (*end == 0 || ((*end == 'p' || *end == 'P') && end[1] == 0)) && val >= 360ul && val <= 4320ul) {
+        uint32_t th = (uint32_t)val & ~1u;
+        *out_w = ((uint32_t)((uint64_t)th * 16u / 9u)) & ~1u;
+        *out_h = th;
+        return 1;
+    }
+    return 0;
+}
 
 void ff_get_target_resolutions(uint32_t *canvas_w, uint32_t *canvas_h, uint32_t *scene_w, uint32_t *scene_h) {
-    const char *o = cfg_value("TOTK_OUTPUT_RES");
-    const char *s = cfg_value("TOTK_RENDER_SCALE");
-    if (!o || !*o) o = "3840x2160";
-    if (!s || !*s) s = "200";
+    const RtGameProfile *gp = game_profile();
+    const char *op = cfg_value("TOTK_OPERATION_MODE");
+    int hh = (op && !strcmp(op, "handheld")) ? 1 : 0;
+    uint32_t base_w = (gp && (hh ? gp->handheld_w : gp->docked_w)) ? (hh ? gp->handheld_w : gp->docked_w) : (hh ? 1280u : 1920u);
+    uint32_t base_h = (gp && (hh ? gp->handheld_h : gp->docked_h)) ? (hh ? gp->handheld_h : gp->docked_h) : (hh ? 720u : 1080u);
 
-    uint32_t cw = 3840, ch = 2160;
-    unsigned w = 0, h = 0;
-    char tail;
-    if (sscanf(o, "%ux%u%c", &w, &h, &tail) == 2 && w >= 640 && h >= 360 && w <= 16384 && h <= 16384) {
-        cw = w & ~1u;
-        ch = h & ~1u;
-    }
-
-    // Determine scale multiplier:
-    // Emulator-style: 1x = 1080p, 2x = 3840x2160 (Native 4K), 3x = 5760x3240, 4x = 7680x4320 (8K).
-    // Percentage-style: 50 = 1080p, 100 = Native 4K (or 1080p if output 1080p), 200 = 2x Native 4K, etc.
-    double mult = 2.0; // default to native 4K
-    if (!strcmp(s, "game")) {
-        mult = 1.0;
-    } else if (!strcmp(s, "native") || !strcmp(s, "4k") || !strcmp(s, "4K")) {
-        mult = 2.0; // 2x of 1080p = 3840x2160
-    } else {
-        char *end = NULL;
-        double val = strtod(s, &end);
-        if (end && (*end == 'x' || *end == 'X')) {
-            mult = val;
-        } else if (val >= 1.0 && val <= 8.0 && val == (int)val) {
-            mult = val;
-        } else if (val >= 25.0 && val <= 800.0) {
-            if (cw >= 3840 && val == 100.0) mult = 2.0; // 100% of 4K canvas = 4K scene
-            else if (val == 200.0) mult = 2.0;          // 200 = 2x = 4K scene
-            else if (val == 300.0) mult = 3.0;          // 300 = 3x = 6K scene
-            else if (val == 400.0) mult = 4.0;          // 400 = 4x = 8K scene
-            else mult = (val / 100.0) * (cw >= 3840 ? 2.0 : 1.0);
+    uint32_t cw = base_w, ch = base_h;
+    const char *res_opt = cfg_get("TOTK_RESOLUTION");
+    if (!ff_parse_resolution(res_opt, &cw, &ch)) {
+        const char *o = cfg_get("TOTK_OUTPUT_RES");
+        unsigned w = 0, h = 0;
+        char tail = 0;
+        if (o && *o && sscanf(o, "%ux%u%c", &w, &h, &tail) == 2 && w >= 640u && h >= 360u && w <= 16384u && h <= 16384u) {
+            cw = w & ~1u;
+            ch = h & ~1u;
         }
     }
 
-    if (mult < 0.25) mult = 0.25;
-    if (mult > 8.0) mult = 8.0;
+    uint32_t sw = cw, sh = ch;
+    const char *s = cfg_value("TOTK_RENDER_SCALE");
+    if (s && *s && strcmp(s, "game") && !ff_streqi(s, "native")) {
+        if (ff_streqi(s, "4k")) {
+            sw = 3840u;
+            sh = 2160u;
+        } else {
+            char *end = NULL;
+            double val = strtod(s, &end);
+            if (end != s && (*end == 'x' || *end == 'X') && end[1] == 0) {
+                double mult = val < 0.25 ? 0.25 : val > 4.0 ? 4.0 : val;
+                sw = (uint32_t)(base_w * mult + 0.5) & ~1u;
+                sh = (uint32_t)(base_h * mult + 0.5) & ~1u;
+            } else if (end != s && *end == 0 && val >= 1.0 && val <= 8.0 && val == (int)val) {
+                double mult = val > 4.0 ? 4.0 : val;
+                sw = (uint32_t)(base_w * mult + 0.5) & ~1u;
+                sh = (uint32_t)(base_h * mult + 0.5) & ~1u;
+            } else if (end != s && *end == 0 && val >= 25.0 && val <= 800.0) {
+                double pct = val / 100.0;
+                sw = (uint32_t)(cw * pct + 0.5) & ~1u;
+                sh = (uint32_t)(ch * pct + 0.5) & ~1u;
+            }
+        }
+    }
 
-    uint32_t sw = (uint32_t)(1920.0 * mult + 0.5) & ~1u;
-    uint32_t sh = (uint32_t)(1080.0 * mult + 0.5) & ~1u;
+    if (sw < 640u) sw = 640u;
+    if (sh < 360u) sh = 360u;
+    if (sw > 7680u) sw = 7680u;
+    if (sh > 4320u) sh = 4320u;
 
     if (canvas_w) *canvas_w = cw;
     if (canvas_h) *canvas_h = ch;
@@ -454,60 +535,229 @@ void ff_get_target_resolutions(uint32_t *canvas_w, uint32_t *canvas_h, uint32_t 
     if (scene_h) *scene_h = sh;
 }
 
-void __wrap_f_700011ff04(Cpu *c) {
-    uint64_t *disp_cfg_ptr = (uint64_t *)(uintptr_t)0x700071beb8;
-    uint64_t disp_cfg = disp_cfg_ptr ? *disp_cfg_ptr : 0;
-    int is_res_call = (disp_cfg && c->x[0] == disp_cfg) || (c->x[1] >= 640 && c->x[2] >= 360);
-
-    if (is_res_call) {
-        uint32_t cw = 0, ch = 0;
-        ff_get_target_resolutions(&cw, &ch, NULL, NULL);
-        rt_log("ff: resolution hook: canvas set to %ux%u (was %ux%u)", cw, ch, (unsigned)c->x[1], (unsigned)c->x[2]);
-        c->x[1] = cw;
-        c->x[2] = ch;
+static inline void ff_call_real(GuestFn real_fn, uint64_t guest_addr, Cpu *c) {
+    if (real_fn) {
+        real_fn(c);
+        return;
     }
-    if (__real_f_700011ff04) __real_f_700011ff04(c);
-    else {
-        GuestFn orig = rt_dispatch_lookup(0x700011ff04ull);
-        if (orig) orig(c);
-    }
+    GuestFn orig = rt_dispatch_lookup(guest_addr);
+    if (orig) orig(c);
 }
 
-void __wrap_f_700011ff1c(Cpu *c) {
-    uint64_t *disp_cfg_ptr = (uint64_t *)(uintptr_t)0x700071beb8;
-    uint64_t disp_cfg = disp_cfg_ptr ? *disp_cfg_ptr : 0;
-    int is_res_call = (disp_cfg && c->x[0] == disp_cfg) || (c->x[1] >= 640 && c->x[2] >= 360);
-
-    if (is_res_call) {
-        uint32_t sw = 0, sh = 0;
-        ff_get_target_resolutions(NULL, NULL, &sw, &sh);
-        rt_log("ff: resolution hook: internal 3D scene set to %ux%u (was %ux%u)", sw, sh, (unsigned)c->x[1], (unsigned)c->x[2]);
-        c->x[1] = sw;
-        c->x[2] = sh;
+static void ff_wrap_disp_canvas(Cpu *c, GuestFn real_fn, uint64_t guest_addr, const char *slot_name) {
+    if (res_ff_enabled()) {
+        uint64_t disp_cfg = plat_mem_readable(0x700071beb8ull, 8) ? LD64(0x700071beb8ull) : 0;
+        if ((disp_cfg && c->x[0] == disp_cfg) || (c->x[1] >= 640u && c->x[2] >= 360u)) {
+            uint32_t cw = 0, ch = 0;
+            ff_get_target_resolutions(&cw, &ch, NULL, NULL);
+            if ((uint32_t)c->x[1] != cw || (uint32_t)c->x[2] != ch)
+                rt_log("ff: %s canvas %ux%u -> %ux%u", slot_name, (unsigned)c->x[1], (unsigned)c->x[2], cw, ch);
+            c->x[1] = cw;
+            c->x[2] = ch;
+        }
     }
-    if (__real_f_700011ff1c) __real_f_700011ff1c(c);
-    else {
-        GuestFn orig = rt_dispatch_lookup(0x700011ff1cull);
-        if (orig) orig(c);
-    }
+    ff_call_real(real_fn, guest_addr, c);
 }
 
-void __wrap_f_7000075cc0(Cpu *c) {
-    uint64_t x21 = c->x[0];
-    if (x21) {
-        float *scale_x = (float *)(uintptr_t)(x21 + 0xb0);
-        float *scale_y = (float *)(uintptr_t)(x21 + 0xb4);
-        *scale_x = 1.0f;
-        *scale_y = 1.0f;
+void __wrap_f_700011ff04(Cpu *c) { ff_wrap_disp_canvas(c, __real_f_700011ff04, 0x700011ff04ull, "docked"); }
+void __wrap_f_700011ff1c(Cpu *c) { ff_wrap_disp_canvas(c, __real_f_700011ff1c, 0x700011ff1cull, "handheld"); }
+
+void __wrap_f_700011fde4(Cpu *c) {
+    if (res_ff_enabled() && c->x[0] && plat_mem_readable(c->x[0] + 0x70a0ull, 4)) {
+        uint32_t tier = LD32(c->x[0] + 0x70a0ull);
+        if (tier < 3u) {
+            ST32(c->x[0] + 0x70a0ull, 3u);
+            static int logged = 0;
+            if (!logged) {
+                logged = 1;
+                rt_log("ff: lifted display tier %u -> 3 (uncapped)", tier);
+            }
+        }
+    }
+    ff_call_real(__real_f_700011fde4, 0x700011fde4ull, c);
+}
+
+void __wrap_f_700006ec74(Cpu *c) {
+    uint64_t cam = c->x[0];
+    if (res_ff_enabled() && cam && plat_mem_readable(cam + 0x94ull, 8)) {
+        uint32_t bx = LD32(cam + 0x94ull), by = LD32(cam + 0x98ull);
+        float sx = 1.0f, sy = 1.0f;
+        memcpy(&sx, &bx, 4);
+        memcpy(&sy, &by, 4);
+        if (sx != 1.0f || sy != 1.0f) {
+            ST32(cam + 0x94ull, 0x3f800000u);
+            ST32(cam + 0x98ull, 0x3f800000u);
+            static int logged = 0;
+            if (!logged) {
+                logged = 1;
+                rt_log("ff: ComCamera frameBufferScale (%.3f, %.3f) -> 1.000", sx, sy);
+            }
+        }
+    }
+    ff_call_real(__real_f_700006ec74, 0x700006ec74ull, c);
+}
+
+void __wrap_f_70000f0960(Cpu *c) {
+    if (res_ff_enabled()) {
         static int logged = 0;
         if (!logged) {
             logged = 1;
-            rt_log("ff: resolution hook: 3D scene scale locked to 1.0x (full native resolution)");
+            rt_log("ff: GetGpuPercent -> 3.0%% (DRS disabled)");
+        }
+        ret_s(c, 3.0f);
+        return;
+    }
+    ff_call_real(__real_f_70000f0960, 0x70000f0960ull, c);
+}
+
+static void ff_read_guest_cstr(uint64_t ptr, char *out, size_t cap) {
+    out[0] = 0;
+    if (!ptr || cap < 2) return;
+    size_t i = 0;
+    for (; i + 1 < cap; i++) {
+        if (!plat_mem_readable(ptr + i, 1)) break;
+        char ch = (char)LD8(ptr + i);
+        if (!ch) break;
+        out[i] = (ch >= 0x20 && ch < 0x7f) ? ch : '?';
+    }
+    out[i] = 0;
+}
+
+static int ff_is_aux_buffer(const char *name) {
+    if (ff_streqi(name, "map") || ff_streqi(name, "mapdepth")) return 1;
+    if (ff_strcasestr(name, "gtao res") && !ff_strcasestr(name, "depthres")) return 1;
+    static const char *const kAux[] = {
+        "shadow", "cube", "dummy", "temp", "mip", "bloom", "streak", "godray",
+        "flare", "sao", "blur", "fog", "lut", "tile", "exposure", "scaledown", "bilateral",
+    };
+    for (size_t i = 0; i < sizeof kAux / sizeof *kAux; i++) {
+        if (ff_strcasestr(name, kAux[i])) return 1;
+    }
+    return 0;
+}
+
+static int ff_is_canvas_buffer(const char *name) {
+    return ff_strcasestr(name, "framebuffer") || ff_strcasestr(name, "cbhud") || ff_strcasestr(name, "cdlss::");
+}
+
+static int ff_is_scene_target(const char *name) {
+    static const char *const kScene[] = {
+        "dyna_cb", "dyna_db", "vehiclecb", "vehicledb", "deferred", "smoothnormals",
+        "fxcapture", "gtao depthres", "screenspacereflection", "reflectionstarget",
+        "reflection_distance_depth", "motionblur", "renderqueue_depthcopy",
+        "screentransition", "displaybuffer", "disp0", "disp1", "disp2",
+    };
+    for (size_t i = 0; i < sizeof kScene / sizeof *kScene; i++) {
+        if (ff_strcasestr(name, kScene[i])) return 1;
+    }
+    return 0;
+}
+
+static void ff_log_buffer_once(const char *kind, const char *name, uint32_t ow, uint32_t oh,
+                               uint32_t nw, uint32_t nh, const char *tag) {
+    typedef struct { char kind[8], name[48]; uint32_t ow, oh, nw, nh; } Entry;
+    static Entry seen[64];
+    static int n_seen = 0;
+    static PlatMutex lock = PLAT_MUTEX_INIT;
+    plat_mutex_lock(&lock);
+    for (int i = 0; i < n_seen; i++) {
+        if (seen[i].ow == ow && seen[i].oh == oh && seen[i].nw == nw && seen[i].nh == nh &&
+            !strcmp(seen[i].kind, kind) && !strcmp(seen[i].name, name)) {
+            plat_mutex_unlock(&lock);
+            return;
         }
     }
-    if (__real_f_7000075cc0) __real_f_7000075cc0(c);
-    else {
-        GuestFn orig = rt_dispatch_lookup(0x7000075cc0ull);
-        if (orig) orig(c);
+    int emit = (n_seen < (int)(sizeof seen / sizeof *seen));
+    if (emit) {
+        Entry *e = &seen[n_seen++];
+        snprintf(e->kind, sizeof e->kind, "%s", kind);
+        snprintf(e->name, sizeof e->name, "%s", name);
+        e->ow = ow; e->oh = oh; e->nw = nw; e->nh = nh;
     }
+    plat_mutex_unlock(&lock);
+    if (emit) rt_log("ff: %sBuffer '%s': %ux%u -> %ux%u (%s)", kind, name, ow, oh, nw, nh, tag);
+}
+
+static void ff_maybe_lift_buffer(uint64_t desc, uint32_t name_off, const char *kind) {
+    if (!desc || !plat_mem_readable(desc, name_off + 8u)) return;
+    uint32_t w = LD32(desc);
+    uint32_t h = LD32(desc + 4u);
+    uint64_t name_ptr = LD64(desc + name_off);
+    char name[64];
+    ff_read_guest_cstr(name_ptr, name, sizeof name);
+    int is_16_9 = (w >= 1280u && w <= 7680u && h >= 720u && (uint64_t)w * 9u == (uint64_t)h * 16u);
+    if (!is_16_9) return;
+    int is_canvas = ff_is_canvas_buffer(name);
+    int is_scene = !is_canvas && ff_is_scene_target(name);
+    if (!name[0] || (!is_canvas && !is_scene && ff_is_aux_buffer(name))) {
+        ff_log_buffer_once(kind, name[0] ? name : "<unnamed>", w, h, w, h, "aux/skip");
+        return;
+    }
+    uint32_t cw = 0, ch = 0, sw = 0, sh = 0;
+    ff_get_target_resolutions(&cw, &ch, &sw, &sh);
+    uint32_t tw = is_canvas ? cw : sw;
+    uint32_t th = is_canvas ? ch : sh;
+    ST32(desc, tw);
+    ST32(desc + 4u, th);
+    ff_log_buffer_once(kind, name, w, h, tw, th, is_canvas ? "canvas" : "scene");
+}
+
+static void ff_log_raw_buffer(uint64_t desc, uint32_t name_off, const char *kind) {
+    if (!desc || !plat_mem_readable(desc, name_off + 8u)) return;
+    uint32_t w = LD32(desc), h = LD32(desc + 4u);
+    if (w < 640u || h < 360u || (uint64_t)w * 9u != (uint64_t)h * 16u) return;
+    char name[64];
+    ff_read_guest_cstr(LD64(desc + name_off), name, sizeof name);
+    ff_log_buffer_once(kind, name[0] ? name : "<unnamed>", w, h, w, h, "raw/nohook");
+}
+
+void __wrap_f_70001080b0(Cpu *c) {
+    if (res_ff_enabled()) ff_maybe_lift_buffer(c->x[0], 0x40u, "Color");
+    else ff_log_raw_buffer(c->x[0], 0x40u, "Color");
+    ff_call_real(__real_f_70001080b0, 0x70001080b0ull, c);
+}
+
+void __wrap_f_7000108170(Cpu *c) {
+    if (res_ff_enabled()) ff_maybe_lift_buffer(c->x[0], 0x20u, "Depth");
+    else ff_log_raw_buffer(c->x[0], 0x20u, "Depth");
+    ff_call_real(__real_f_7000108170, 0x7000108170ull, c);
+}
+
+void __wrap_f_700002c764(Cpu *c) {
+    if (c->x[2] && plat_mem_readable(c->x[2] + 0x2bcull, 12u)) {
+        float old_scale = 0.0f, old_w = 0.0f, old_h = 0.0f;
+        uint32_t bs = LD32(c->x[2] + 0x2bcull);
+        uint32_t bw = LD32(c->x[2] + 0x2c0ull);
+        uint32_t bh = LD32(c->x[2] + 0x2c4ull);
+        memcpy(&old_scale, &bs, 4);
+        memcpy(&old_w, &bw, 4);
+        memcpy(&old_h, &bh, 4);
+        if (res_ff_enabled()) {
+            uint32_t cw = 0, ch = 0;
+            ff_get_target_resolutions(&cw, &ch, NULL, NULL);
+            float new_scale = 1.0f, fw = (float)cw, fh = (float)ch;
+            uint32_t us = 0, uw = 0, uh = 0;
+            memcpy(&us, &new_scale, 4);
+            memcpy(&uw, &fw, 4);
+            memcpy(&uh, &fh, 4);
+            ST32(c->x[2] + 0x2bcull, us);
+            ST32(c->x[2] + 0x2c0ull, uw);
+            ST32(c->x[2] + 0x2c4ull, uh);
+            if (old_scale != 1.0f || old_w != fw || old_h != fh) {
+                static int logged = 0;
+                if (!logged) {
+                    logged = 1;
+                    rt_log("ff: C3dFxDlss scale=%.3f->1.000 out=%.0fx%.0f->%ux%u",
+                           old_scale, old_w, old_h, cw, ch);
+                }
+            }
+        } else {
+            static int logged = 0;
+            if (!logged) {
+                logged = 1;
+                rt_log("ff: C3dFxDlss (nohook) scale=%.3f out=%.0fx%.0f", old_scale, old_w, old_h);
+            }
+        }
+    }
+    ff_call_real(__real_f_700002c764, 0x700002c764ull, c);
 }

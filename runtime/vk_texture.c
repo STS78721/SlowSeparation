@@ -150,6 +150,11 @@ static void make_key(const tex_t *t, TexKey *k) {
     memset(k, 0, sizeof *k);
     k->addr = (uintptr_t)t->mem;
     k->d = t->d;
+    // An unset depth-stencil mode samples depth (nvnTextureGetDepthStencilMode): the same image as an explicit DEPTH.
+    // Without this, a texture the game builds with SetDepthStencilMode(DEPTH) and one built without it at the same
+    // storage get separate images, and a copy into one is never seen through the other (Fast Fusion's sky reads
+    // RenderQueue_DepthCopy through the second and stayed black at 1:1).
+    if (!k->d.set_dsmode) k->d.set_dsmode = 1, k->d.dsmode = NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH;
     k->has_layout = t->has_layout;
     memcpy(k->layout, t->layout, 8);
 }
