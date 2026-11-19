@@ -50,8 +50,9 @@ typedef struct Tex {
     uint8_t hashed;               // chash holds the storage hash taken just before the last upload (untracked pages)
     uint64_t chash;
     struct Tex *next_at;          // other entries at the same storage address
-    uint8_t gpu_dirty;            // mirrored, and the GPU wrote the image after the last write-back to the storage
+    uint8_t gpu_dirty;            // mirrored render target: 0 clean, 1 needs write-back, 2 inline readback queued on gpu_fence
     uint32_t gpu_gen;             // page generation when the GPU write that set gpu_dirty was recorded
+    uint32_t wb_gen;              // page generation right after this texture's newest completion write-back
     uint64_t gpu_seq;             // order of that GPU write among all of them (gpu_writes)
     uint64_t gpu_fence;           // fence of the submission that made that write (0: not recorded in one)
     uint64_t wr_fence;            // any entry: newest submission recorded to write its image (render, copy, clear,
@@ -94,7 +95,7 @@ static Tex *rel_head, *rel_tail;   // released entries in release order (sweep_r
 static uint64_t n_uploads, n_reuploads;
 // Re-uploads since the last perf line (tex_lock): all, and those of textures a WriteTexels wrote since their last upload.
 static uint64_t ru_n, ru_bytes, ru_ns, ru_wt_n, ru_wt_bytes, ru_wt_ns;
-static uint64_t n_hash_kept;   // untracked checks whose storage hash matched the last upload's (untracked_same)
+static uint64_t n_hash_kept;   // untracked or shared-page checks whose storage hash matched the last upload's (untracked_same)
 // TOTK_TEX_ALIAS (default on; =0: a new image over live storage starts empty): a new descriptor over the storage of a
 // live image that the GPU wrote gets that image's content (alias_copy). Counts since the last log line.
 static int tex_alias = -1;
@@ -881,15 +882,19 @@ static volatile int32_t n_kept;
 // slots used in turn, and the CPU reads them a frame later. One slot's rect target shares its page with data the CPU
 // writes every frame: without the copy its renders were never written back, the game read a zero rect every other
 // frame and the target's name label blinked. TOTK_WB_EXACT=0 restores the page-only decision.
-static int storage_rewritten(const Tex *e, uint32_t since, uint32_t *now) {
+static int storage_rewritten_with_snap(const Tex *e, uint32_t since, const uint8_t *snap, uint32_t *now) {
     uint64_t lo = (e->pub.addr + 0xfff) & ~0xfffull, hi = (e->pub.addr + e->t.L.size) & ~0xfffull;
     if (hi <= lo) lo = e->pub.addr, hi = e->pub.addr + e->t.L.size;
     int ch = vk_mem_changed(lo, hi - lo, since, now);
-    if (ch != 1 || !since || !e->snap || memcmp(e->snap, (const void *)(uintptr_t)e->pub.addr, e->t.L.size)) return ch;
+    if (ch != 1 || !since || !snap || memcmp(snap, (const void *)(uintptr_t)e->pub.addr, e->t.L.size)) return ch;
     log_limited(&n_kept, "write-back of %#llx kept: fmt %#x %ux%u, %llu bytes; a neighbour wrote its page",
                 (unsigned long long)e->pub.addr, e->t.d.format, e->t.d.width, e->t.d.height,
                 (unsigned long long)e->t.L.size);
     return 0;
+}
+
+static int storage_rewritten(const Tex *e, uint32_t since, uint32_t *now) {
+    return storage_rewritten_with_snap(e, since, e->snap, now);
 }
 
 // ---- content hash for untracked storage (TOTK_TEX_HASH, default on; =0 uploads again on every untracked check)
@@ -931,12 +936,14 @@ static uint64_t storage_hash(const Tex *e) {
     return h;
 }
 
-// Called with the page answer ch just before e would be uploaded. Untracked (-1): takes the storage hash for the upload
-// that may follow and returns 1 when it equals the one taken before e's last upload (the upload is then skipped).
-// Tracked: forgets the hash, since an upload made on a write-watch answer has none.
+// Called with the page answer ch just before e would be uploaded. Untracked (-1): always hash before upload and skip
+// when unchanged. Tracked re-upload (ch == 1, e->uploaded, size <= 512 KiB): a neighbour CPU buffer or small GPU
+// write-back sharing a 4 KiB page can dirty e's page every frame even though e's own bytes did not change; hash before
+// uploading so unchanged textures are skipped on subsequent frames (TOTK_TEX_HASH=0 disables).
 static int untracked_same(Tex *e, int ch) {
     if (tex_hash < 0) tex_hash = cfg_bool("TOTK_TEX_HASH");
-    if (ch != -1 || !tex_hash) { e->hashed = 0; return 0; }
+    int check = tex_hash && (ch == -1 || (ch == 1 && e->uploaded && e->t.L.size <= (512ull << 10)));
+    if (!check) { e->hashed = 0; return 0; }
     uint64_t h = storage_hash(e);
     int same = e->hashed && e->uploaded && h == e->chash;
     e->chash = h, e->hashed = 1;
@@ -1396,7 +1403,7 @@ void vk_texture_new_submit(void) {
                (unsigned long long)n_alias_uninit);
         n_alias_copied = n_alias_upload = n_alias_uninit = 0;
         rt_log("perf: frame %llu: texture re-uploads %llu (%.1f MiB, %.2f ms), after WriteTexels %llu (%.1f MiB, %.2f ms); "
-               "untracked and unchanged, kept %llu",
+               "hash-unchanged, kept %llu",
                (unsigned long long)f * 60, (unsigned long long)ru_n, ru_bytes / 1048576.0, ru_ns / 1e6,
                (unsigned long long)ru_wt_n, ru_wt_bytes / 1048576.0, ru_wt_ns / 1e6, (unsigned long long)n_hash_kept);
         ru_n = ru_bytes = ru_ns = ru_wt_n = ru_wt_bytes = ru_wt_ns = n_hash_kept = 0;
@@ -1657,6 +1664,270 @@ static int owned_dirty(uint64_t addr, uint64_t size, Tex **hit) {
     return n;
 }
 
+static void sort_wb_by_seq(Tex **hit, int k) {
+    for (int i = 1; i < k; i++)
+        for (int j = i; j > 0 && hit[j - 1]->gpu_seq > hit[j]->gpu_seq; j--) {
+            Tex *x = hit[j];
+            hit[j] = hit[j - 1], hit[j - 1] = x;
+        }
+}
+
+typedef struct {
+    Region g;
+    NVNcopyRegion r;
+    size_t stg_off;
+    size_t slice;
+    size_t ib;
+} SmallWbReg;
+
+typedef struct {
+    TexKey key;
+    uint64_t addr;
+    uint64_t size;
+    uint64_t gpu_seq;
+    uint32_t gpu_gen;
+    uint32_t first_reg, nreg;
+    int rgb;
+    uint8_t *snap;
+} SmallWbItem;
+
+typedef struct {
+    VkBuffer sb;
+    VmaAllocation sa;
+    uint8_t *stg;
+    uint32_t nitems, nregs;
+    SmallWbItem *items;
+    SmallWbReg *regs;
+} SmallWbJob;
+
+static void wb_note(const Tex *e, int skipped);
+
+static void small_wb_cb(void *arg) {
+    SmallWbJob *job = arg;
+    VkCtx *c = vk_ctx();
+    vmaInvalidateAllocation(c->vma, job->sa, 0, VK_WHOLE_SIZE);
+    Tex **tex = calloc(job->nitems ? job->nitems : 1, sizeof *tex);
+    uint8_t *keep = calloc(job->nitems ? job->nitems : 1, 1);
+    if (!tex || !keep) rt_fatal("vk: out of memory for a texture write-back");
+    lock();
+    for (uint32_t i = 0; i < job->nitems; i++) {
+        const SmallWbItem *it = &job->items[i];
+        Tex *e = nvn_hm_get(&by_key, &it->key);
+        if (!e || !e->gpu_dirty || e->gpu_seq < it->gpu_seq || e->pub.addr != it->addr || e->t.L.size != it->size || !e->t.mem) {
+            perf_count(PERF_CNT_WB_SKIP);
+            continue;
+        }
+        if (!plat_mem_readable(e->pub.addr, e->t.L.size)) {
+            if (e->gpu_seq == it->gpu_seq) e->gpu_dirty = 0;
+            perf_count(PERF_CNT_WB_SKIP);
+            continue;
+        }
+        uint32_t now;
+        int use_item = e->gpu_seq != it->gpu_seq && e->wb_gen <= it->gpu_gen;
+        uint32_t since = use_item ? it->gpu_gen : (e->gpu_seq == it->gpu_seq ? e->gpu_gen : e->wb_gen);
+        const uint8_t *snap = use_item ? it->snap : e->snap;
+        if (storage_rewritten_with_snap(e, since, snap, &now) == 1) {
+            if (e->gpu_seq == it->gpu_seq) e->gpu_dirty = 0;
+            perf_count(PERF_CNT_WB_SKIP);
+            continue;
+        }
+        tex[i] = e;
+        keep[i] = 1;
+    }
+    for (uint32_t i = 0; i < job->nitems; i++) {
+        if (!keep[i]) continue;
+        Tex *e = tex[i];
+        const SmallWbItem *it = &job->items[i];
+        for (uint32_t k = 0; k < it->nreg; k++) {
+            const SmallWbReg *sr = &job->regs[it->first_reg + k];
+            uint8_t *s0 = job->stg + sr->stg_off;
+            if (it->rgb) {
+                uint8_t *buf = malloc(sr->g.img * (size_t)sr->g.nz);
+                if (!buf) rt_fatal("vk: out of memory for a texture write-back");
+                for (int z = 0; z < sr->g.nz; z++) {
+                    const uint8_t *s = s0 + sr->slice * (size_t)z;
+                    uint8_t *m = buf + (size_t)z * sr->g.img;
+                    for (size_t y = 0; y < sr->g.hb; y++)
+                        shrink_rgb(e->t.d.format, s + y * (size_t)sr->r.width * sr->ib, m + y * sr->g.row, (uint32_t)sr->r.width);
+                }
+                storage_texels(&e->t, &sr->g, &sr->r, buf, 1);
+                free(buf);
+            } else {
+                storage_texels(&e->t, &sr->g, &sr->r, s0, 1);
+            }
+        }
+    }
+    for (uint32_t i = 0; i < job->nitems; i++) {
+        if (!keep[i]) continue;
+        Tex *e = tex[i];
+        const SmallWbItem *it = &job->items[i];
+        if (e->gpu_seq == it->gpu_seq) {
+            e->gpu_dirty = 0;
+        } else {
+            // Swallow our completion write-back on pages shared with a newer pipelined render of the same target.
+            uint32_t after = 0;
+            storage_rewritten_with_snap(e, 0, NULL, &after);
+            if (after > e->wb_gen) e->wb_gen = after;
+            if (after > e->gpu_gen) e->gpu_gen = after;
+            if (e->snap && plat_mem_readable(e->pub.addr, e->t.L.size))
+                memcpy(e->snap, (const void *)(uintptr_t)e->pub.addr, e->t.L.size);
+        }
+        perf_count(PERF_CNT_WB);
+    }
+    unlock();
+    free(keep);
+    free(tex);
+    for (uint32_t i = 0; i < job->nitems; i++) free(job->items[i].snap);
+    vmaDestroyBuffer(c->vma, job->sb, job->sa);
+    free(job->items);
+    free(job->regs);
+    free(job);
+}
+
+int vk_texture_small_wb_end(VkCommandBuffer cb, uint64_t fence) {
+    if (!__atomic_load_n(&small_pending, __ATOMIC_ACQUIRE)) return 0;
+    lock();
+    wb_cfg_init();
+    plat_mutex_lock_shared(&owned_lock);
+    int n = 0, left = 0;
+    for (int i = 0; i < nowned; i++) {
+        Tex *e = owned[i];
+        if (e->gpu_dirty == 1 && e->t.L.size <= wb_limit) {
+            if (e->gpu_fence == fence) n++;
+            else left = 1;
+        }
+    }
+    Tex **hit = n ? malloc(sizeof *hit * (size_t)n) : NULL;
+    if (n && !hit) rt_fatal("vk: out of memory for a texture write-back");
+    int k = 0;
+    for (int i = 0; i < nowned && k < n; i++) {
+        Tex *e = owned[i];
+        if (e->gpu_dirty == 1 && e->t.L.size <= wb_limit && e->gpu_fence == fence) hit[k++] = e;
+    }
+    plat_mutex_unlock_shared(&owned_lock);
+    if (!k) {
+        free(hit);
+        __atomic_store_n(&small_pending, left, __ATOMIC_RELEASE);
+        unlock();
+        return 0;
+    }
+    sort_wb_by_seq(hit, k);
+    SmallWbItem *items = calloc((size_t)k, sizeof *items);
+    uint32_t reg_cap = (uint32_t)k, copy_cap = (uint32_t)k;
+    SmallWbReg *regs = malloc(sizeof *regs * reg_cap);
+    VkBufferImageCopy *copies = malloc(sizeof *copies * copy_cap);
+    uint32_t *copy_counts = calloc((size_t)k, sizeof *copy_counts);
+    if (!items || !regs || !copies || !copy_counts) rt_fatal("vk: out of memory for a texture write-back");
+    uint32_t nitems = 0, nregs = 0, ncopies = 0;
+    size_t total = 0;
+    for (int i = 0; i < k; i++) {
+        Tex *e = hit[i];
+        VkImageAspectFlags aspect;
+        if (e->f.astc_bw || !read_aspect(e, &aspect)) {
+            e->gpu_dirty = 0;
+            continue;
+        }
+        if (wb_trace && e->t.L.size > WB_SMALL_DEFAULT) wb_note(e, 0);
+        SmallWbItem *it = &items[nitems];
+        it->key = e->key;
+        it->addr = e->pub.addr;
+        it->size = e->t.L.size;
+        it->gpu_seq = e->gpu_seq;
+        it->gpu_gen = e->gpu_gen;
+        it->first_reg = nregs;
+        it->nreg = 0;
+        it->rgb = e->f.expand_rgb;
+        if (e->snap && e->t.L.size && plat_mem_readable(e->pub.addr, e->t.L.size)) {
+            it->snap = malloc(e->t.L.size);
+            if (!it->snap) rt_fatal("vk: out of memory for a texture write-back");
+            memcpy(it->snap, e->snap, e->t.L.size);
+        }
+        const nvn_texdesc *d = &e->t.d;
+        int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D;
+        uint32_t levels = linear ? 1 : e->pub.levels, layers = linear || is3d ? 1 : e->pub.layers;
+        for (uint32_t lv = 0; lv < levels; lv++)
+            for (uint32_t ly = 0; ly < layers; ly++) {
+                view_t v = {.set_levels = 1, .set_layers = 1, .base_level = (uint8_t)lv, .min_layer = (uint16_t)ly};
+                NVNcopyRegion r = {.width = (int)mip(d->width, lv),
+                                   .height = d->target == 0 || d->target == 3 ? 1 : (int)mip(d->height, lv),
+                                   .depth = is3d ? (int)mip(d->depth, lv) : 1};
+                Region g;
+                if (!region_of(&e->t, &v, &r, 0, 0, &g) || g.level >= e->pub.levels) continue;
+                uint32_t w = (uint32_t)r.width, h = (uint32_t)r.height;
+                size_t ib = it->rgb ? (size_t)g.bpb / 3 * 4 : 0;
+                size_t slice = ib ? (size_t)w * h * ib : g.wb * g.hb;
+                total = (total + 15) & ~(size_t)15;
+                size_t reg_off = total;
+                total += slice * (size_t)g.nz;
+                if (nregs == reg_cap) {
+                    reg_cap *= 2;
+                    regs = realloc(regs, sizeof *regs * reg_cap);
+                    if (!regs) rt_fatal("vk: out of memory for a texture write-back");
+                }
+                regs[nregs++] = (SmallWbReg){.g = g, .r = r, .stg_off = reg_off, .slice = slice, .ib = ib};
+                it->nreg++;
+                if (ncopies + (uint32_t)g.nz > copy_cap) {
+                    while (ncopies + (uint32_t)g.nz > copy_cap) copy_cap *= 2;
+                    copies = realloc(copies, sizeof *copies * copy_cap);
+                    if (!copies) rt_fatal("vk: out of memory for a texture write-back");
+                }
+                for (int z = 0; z < g.nz; z++) {
+                    copies[ncopies++] = (VkBufferImageCopy){
+                        .bufferOffset = reg_off + slice * (size_t)z,
+                        .imageSubresource = {aspect, g.level, g.is3d ? 0 : g.layer0 + (uint32_t)r.zoffset + (uint32_t)z, 1},
+                        .imageOffset = {r.xoffset, r.yoffset, g.is3d ? r.zoffset + z : 0},
+                        .imageExtent = {w, h, 1}};
+                }
+                copy_counts[nitems] += (uint32_t)g.nz;
+            }
+        if (it->nreg) {
+            e->gpu_dirty = 2;
+            nitems++;
+        } else {
+            free(it->snap);
+            it->snap = NULL;
+            e->gpu_dirty = 0;
+        }
+    }
+    __atomic_store_n(&small_pending, left, __ATOMIC_RELEASE);
+    if (!nitems || !ncopies || !total) {
+        for (uint32_t i = 0; i < nitems; i++) free(items[i].snap);
+        free(copy_counts);
+        free(copies);
+        free(regs);
+        free(items);
+        free(hit);
+        unlock();
+        return 0;
+    }
+    SmallWbJob *job = calloc(1, sizeof *job);
+    if (!job) rt_fatal("vk: out of memory for a texture write-back");
+    job->stg = vk_staging(total, &job->sb, &job->sa);
+    job->nitems = nitems;
+    job->nregs = nregs;
+    job->items = items;
+    job->regs = regs;
+    barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    uint32_t c_off = 0, copy_cmds = 0;
+    for (uint32_t i = 0; i < nitems; i++) {
+        uint32_t cnt = copy_counts[i];
+        Tex *e = nvn_hm_get(&by_key, &items[i].key);
+        if (e && cnt) {
+            vkCmdCopyImageToBuffer(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, job->sb, cnt, copies + c_off);
+            copy_cmds++;
+        }
+        c_off += cnt;
+    }
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
+            VK_ACCESS_2_HOST_READ_BIT);
+    free(copy_counts);
+    free(copies);
+    free(hit);
+    unlock();   // release tex_lock before acquiring vk_sync st_lock
+    vk_completion_add(fence, small_wb_cb, job);
+    return (int)(2 + copy_cmds);
+}
+
 // A storage image may be written by the shaders of the submission being recorded (texture lock held, vk_exec_draw.c
 // tex_info). Its storage is not marked GPU-owned: only the write fence for ReadTexels.
 void vk_texture_storage_bound_locked(const VkTexImage *img) {
@@ -1709,6 +1980,20 @@ uint64_t vk_texture_dirty_fence(uint64_t addr, uint64_t size) {
 // first, so where two descriptors share storage the newer render wins.
 void vk_texture_write_back(uint64_t addr, uint64_t size) {
     lock();
+    uint64_t waited = 0;
+    for (;;) {
+        uint64_t wait_f = 0;
+        for (int i = owned_lower(addr > max_owned ? addr - max_owned : 0); i < nowned && owned[i]->pub.addr < addr + size; i++) {
+            const Tex *e = owned[i];
+            if (e->gpu_dirty == 2 && e->pub.addr + e->t.L.size > addr && e->gpu_fence > wait_f) wait_f = e->gpu_fence;
+        }
+        if (!wait_f || wait_f <= waited) break;
+        unlock();   // never wait on a completion callback while holding tex_lock
+        int ok = vk_sync_fence_wait(wait_f, UINT64_MAX);
+        lock();
+        if (!ok) break;
+        waited = wait_f;
+    }
     Tex **hit = malloc(sizeof *hit * (size_t)(nowned + 1));
     if (!hit) rt_fatal("vk: out of memory for a texture write-back");
     int n = owned_dirty(addr, size, hit), k = 0;   // owned[] cannot change while tex_lock is held
@@ -1717,11 +2002,7 @@ void vk_texture_write_back(uint64_t addr, uint64_t size) {
         if (storage_rewritten(hit[i], hit[i]->gpu_gen, &now) == 1) hit[i]->gpu_dirty = 0;
         else hit[k++] = hit[i];
     }
-    for (int i = 1; i < k; i++)
-        for (int j = i; j > 0 && hit[j - 1]->gpu_seq > hit[j]->gpu_seq; j--) {
-            Tex *x = hit[j];
-            hit[j] = hit[j - 1], hit[j - 1] = x;
-        }
+    sort_wb_by_seq(hit, k);
     for (int i = 0; i < k; i++) write_back(hit[i]);
     for (int i = 0; i < k; i++) perf_count(PERF_CNT_WB);
     for (int i = k; i < n; i++) perf_count(PERF_CNT_WB_SKIP);
@@ -1761,13 +2042,13 @@ void vk_texture_write_back_small(uint64_t fence) {
     __atomic_store_n(&small_pending, 0, __ATOMIC_RELAXED);
     plat_mutex_lock_shared(&owned_lock);
     int n = 0, later = 0;
-    for (int i = 0; i < nowned; i++) n += owned[i]->gpu_dirty && owned[i]->t.L.size <= wb_limit;
+    for (int i = 0; i < nowned; i++) n += owned[i]->gpu_dirty == 1 && owned[i]->t.L.size <= wb_limit;
     Tex **hit = n ? malloc(sizeof *hit * (size_t)n) : NULL;
     if (n && !hit) rt_fatal("vk: out of memory for a texture write-back");
     n = 0;
     for (int i = 0; i < nowned; i++) {
         Tex *e = owned[i];
-        if (!e->gpu_dirty) continue;
+        if (e->gpu_dirty != 1) continue;
         if (e->t.L.size > wb_limit) {
             if (wb_trace && e->gpu_fence <= fence) {
                 wb_note(e, 1);
@@ -1789,11 +2070,7 @@ void vk_texture_write_back_small(uint64_t fence) {
         if (storage_rewritten(hit[i], hit[i]->gpu_gen, &now) == 1) hit[i]->gpu_dirty = 0;
         else hit[k++] = hit[i];
     }
-    for (int i = 1; i < k; i++)
-        for (int j = i; j > 0 && hit[j - 1]->gpu_seq > hit[j]->gpu_seq; j--) {
-            Tex *x = hit[j];
-            hit[j] = hit[j - 1], hit[j - 1] = x;
-        }
+    sort_wb_by_seq(hit, k);
     for (int i = 0; i < k; i++) write_back(hit[i]);
     for (int i = 0; i < k; i++) perf_count(PERF_CNT_WB);
     for (int i = k; i < n; i++) perf_count(PERF_CNT_WB_SKIP);

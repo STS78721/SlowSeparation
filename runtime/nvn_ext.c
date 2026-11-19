@@ -457,13 +457,7 @@ NVN_API(nvnCommandBufferSetSampleMask) {
     int m = (int)arg_x(c, 1);
     if ((m & 0xffff) != 0xffff) ONCE("SetSampleMask %#x: fixed-function sample mask not applied", m);
 }
-// void nvnCommandBufferSetDepthBounds(NVNcommandBuffer *cmd, NVNboolean enable, float min, float max): disabling is
-// exact; an enabled range is drawn without the test and reported
-NVN_API(nvnCommandBufferSetDepthBounds) {
-    float lo = arg_s(c, 0), hi = arg_s(c, 1);
-    if (nvn_arg_bool(c, 1) && (lo > 0.0f || hi < 1.0f))
-        ONCE("SetDepthBounds [%g, %g]: depth-bounds test not applied (fragments outside the range are kept)", lo, hi);
-}
+// SetDepthBounds is recorded in nvn_api_cmd.c (OP_DEPTH_BOUNDS).
 // void nvnCommandBufferSetProvokingVertexMode(NVNcommandBuffer *cmd, int mode) (NVN 55): the NVN default is the last
 // vertex (GL convention); only the default is accepted
 NVN_API(nvnCommandBufferSetProvokingVertexMode) {

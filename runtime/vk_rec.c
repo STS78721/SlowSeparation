@@ -41,7 +41,8 @@ enum {
     R_CopyImage, R_CopyImageToBuffer, R_Dispatch, R_DispatchIndirect, R_Draw, R_DrawIndexed, R_DrawIndexedIndirect,
     R_DrawIndexedIndirectCount,
     R_EndQuery, R_EndRendering, R_FillBuffer, R_PipelineBarrier2, R_PushConstants, R_ResetQueryPool, R_ResolveImage,
-    R_SetBlendConstants, R_SetCullMode, R_SetDepthBias, R_SetDepthBiasEnable, R_SetDepthCompareOp, R_SetDepthTestEnable,
+    R_SetBlendConstants, R_SetCullMode, R_SetDepthBias, R_SetDepthBiasEnable, R_SetDepthBounds, R_SetDepthBoundsTestEnable,
+    R_SetDepthCompareOp, R_SetDepthTestEnable,
     R_SetDepthWriteEnable, R_SetFrontFace, R_SetPrimitiveRestartEnable, R_SetPrimitiveTopology,
     R_SetRasterizerDiscardEnable, R_SetScissorWithCount, R_SetStencilCompareMask, R_SetStencilOp, R_SetStencilReference,
     R_SetStencilTestEnable, R_SetStencilWriteMask, R_SetViewportWithCount, R_WriteTimestamp, R_WriteTimestamp2,
@@ -312,6 +313,10 @@ FIXED(SetCullMode, (VkCommandBuffer cb, VkCullModeFlags m), (cb, m), VkCullModeF
 FIXED(SetDepthBias, (VkCommandBuffer cb, float c, float cl, float s), (cb, c, cl, s), float c, cl, s)
 #define PACK_SetDepthBiasEnable a->v = v
 FIXED(SetDepthBiasEnable, (VkCommandBuffer cb, VkBool32 v), (cb, v), VkBool32 v)
+#define PACK_SetDepthBounds *a = (A_SetDepthBounds){lo, hi}
+FIXED(SetDepthBounds, (VkCommandBuffer cb, float lo, float hi), (cb, lo, hi), float lo, hi)
+#define PACK_SetDepthBoundsTestEnable a->v = v
+FIXED(SetDepthBoundsTestEnable, (VkCommandBuffer cb, VkBool32 v), (cb, v), VkBool32 v)
 #define PACK_SetDepthCompareOp a->v = v
 FIXED(SetDepthCompareOp, (VkCommandBuffer cb, VkCompareOp v), (cb, v), VkCompareOp v)
 #define PACK_SetDepthTestEnable a->v = v
@@ -632,6 +637,8 @@ static void exec_packet(uint32_t op, void *p) {
     F(SetCullMode, a->v)
     F(SetDepthBias, a->c, a->cl, a->s)
     F(SetDepthBiasEnable, a->v)
+    F(SetDepthBounds, a->lo, a->hi)
+    F(SetDepthBoundsTestEnable, a->v)
     F(SetDepthCompareOp, a->v)
     F(SetDepthTestEnable, a->v)
     F(SetDepthWriteEnable, a->v)

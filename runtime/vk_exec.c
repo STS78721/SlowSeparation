@@ -113,6 +113,7 @@ static void state_reset(VkExec *ex) {
     memset(ex, 0, sizeof *ex);
     ex->st_vmask[0] = ex->st_vmask[1] = ex->st_wmask[0] = ex->st_wmask[1] = 0xff;
     ex->depth_range[1] = 1.0f;
+    ex->depth_bounds[1] = 1.0f;
     vk_pipe_state_defaults(&ex->pipe);
     ex->barrier_at = -1;
 }
@@ -932,6 +933,14 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
             ex->dirty |= VK_EXEC_DIRTY_BLEND_CONST;
             break;
         case OP_DEPTH_CLAMP: ex->pipe.depth_clamp = ((const p_flag *)a)->value != 0; break;
+        case OP_DEPTH_BOUNDS: {
+            const p_depth_bounds *b = a;
+            ex->depth_bounds_en = b->enable != 0;
+            ex->depth_bounds[0] = b->lo;
+            ex->depth_bounds[1] = b->hi;
+            ex->dirty |= VK_EXEC_DIRTY_DEPTH_BOUNDS;
+            break;
+        }
         case OP_RASTER_DISCARD: ex->pipe.raster_discard = ((const p_flag *)a)->value != 0; break;
         case OP_PRIM_RESTART: ex->prim_restart = *(const p_prim_restart *)a; break;
         case OP_COPY_STRIDE: ex->copy_stride = ((const p_copy_stride *)a)->stride; break;
@@ -993,7 +1002,11 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
     vk_exec_pass_end(ex);
     x_here = 0;
     if (ex->recorded) vk_exec_barrier(ex);   // later submissions see this one's writes
-    if (memory) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
+    if (memory) {
+        ex->recorded += vk_mem_mirror_end(ex->cb, fence);
+        ex->recorded += vk_texture_small_wb_end(ex->cb, fence);   // small mirrored targets go back on fence completion
+        vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
+    }
     if (ex->nviews) {
         ViewList *l = malloc(sizeof *l + sizeof(VkImageView) * (size_t)ex->nviews);
         if (!l) rt_fatal("vk: out of memory");

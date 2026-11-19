@@ -85,6 +85,8 @@ void rec_write_mask(PFN_vkCmdSetColorWriteMaskEXT fn, VkCommandBuffer cb, uint32
     X(SetCullMode, (VkCommandBuffer cb, VkCullModeFlags m), (cb, m))                                                     \
     X(SetDepthBias, (VkCommandBuffer cb, float c, float cl, float s), (cb, c, cl, s))                                    \
     X(SetDepthBiasEnable, (VkCommandBuffer cb, VkBool32 v), (cb, v))                                                     \
+    X(SetDepthBounds, (VkCommandBuffer cb, float lo, float hi), (cb, lo, hi))                                            \
+    X(SetDepthBoundsTestEnable, (VkCommandBuffer cb, VkBool32 v), (cb, v))                                               \
     X(SetDepthCompareOp, (VkCommandBuffer cb, VkCompareOp v), (cb, v))                                                   \
     X(SetDepthTestEnable, (VkCommandBuffer cb, VkBool32 v), (cb, v))                                                     \
     X(SetDepthWriteEnable, (VkCommandBuffer cb, VkBool32 v), (cb, v))                                                    \
@@ -139,6 +141,8 @@ REC_CMDS(REC_DECL)
 #define vkCmdSetCullMode rc_vkCmdSetCullMode
 #define vkCmdSetDepthBias rc_vkCmdSetDepthBias
 #define vkCmdSetDepthBiasEnable rc_vkCmdSetDepthBiasEnable
+#define vkCmdSetDepthBounds rc_vkCmdSetDepthBounds
+#define vkCmdSetDepthBoundsTestEnable rc_vkCmdSetDepthBoundsTestEnable
 #define vkCmdSetDepthCompareOp rc_vkCmdSetDepthCompareOp
 #define vkCmdSetDepthTestEnable rc_vkCmdSetDepthTestEnable
 #define vkCmdSetDepthWriteEnable rc_vkCmdSetDepthWriteEnable

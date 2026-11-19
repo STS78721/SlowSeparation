@@ -53,7 +53,7 @@ static void c0_lay_set(VkExec *ex, const GfxShader *cs) {
     c0_push = ex->push[1];
 }
 
-enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_FAULT_SKIP, W_FAULT_SKIP2, W_SKIP_VS, W_SKIP_FS, W_RESET, W_GEOMETRY, W_COUNT };
+enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_FAULT_SKIP, W_FAULT_SKIP2, W_SKIP_VS, W_SKIP_FS, W_RESET, W_GEOMETRY, W_DEPTH_BOUNDS, W_COUNT };
 
 static void warn_once(int key, const char *fmt, ...) {
     static volatile int32_t seen[W_COUNT];
@@ -2319,6 +2319,20 @@ static void record_fixed(VkExec *ex) {
             vkCmdSetStencilWriteMask(cb, face, ex->st_wmask[f]);
             vkCmdSetStencilReference(cb, face, ex->st_ref[f]);
             ex->recorded += 3;
+        }
+    }
+    if (ex->dirty & VK_EXEC_DIRTY_DEPTH_BOUNDS) {
+        if (vk_ctx()->has_depth_bounds) {
+            float lo = ex->depth_bounds[0], hi = ex->depth_bounds[1];
+            // Clamp to [0, 1] unless VK_EXT_depth_range_unrestricted is enabled (VUID-vkCmdSetDepthBounds-00600/00601).
+            if (!(lo >= 0.0f)) lo = 0.0f; else if (lo > 1.0f) lo = 1.0f;
+            if (!(hi >= 0.0f)) hi = 0.0f; else if (hi > 1.0f) hi = 1.0f;
+            vkCmdSetDepthBoundsTestEnable(cb, ex->depth_bounds_en ? VK_TRUE : VK_FALSE);
+            vkCmdSetDepthBounds(cb, lo, hi);
+            ex->recorded += 2;
+        } else if (ex->depth_bounds_en && (ex->depth_bounds[0] > 0.0f || ex->depth_bounds[1] < 1.0f)) {
+            warn_once(W_DEPTH_BOUNDS, "SetDepthBounds [%g, %g]: GPU lacks depthBounds feature (fragments outside range kept)",
+                      ex->depth_bounds[0], ex->depth_bounds[1]);
         }
     }
     ex->dirty = 0;

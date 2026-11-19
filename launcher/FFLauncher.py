@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
+import hashlib
 import json
 import math
 import os
@@ -42,10 +43,11 @@ from ff_dump import (
 
 APP_TITLE = "FF SlowSeparation"
 APP_SUBTITLE = "Fast Fusion  ·  Native Windows PC Recompilation"
-DEFAULT_VERSION = "Alpha 0.1.0a"
+DEFAULT_VERSION = "Alpha 0.1.1"
 GITHUB_URL = "https://github.com/STS78721/SlowSeparation"
 RELEASES_URL = GITHUB_URL + "/releases"
 RELEASES_API_URL = "https://api.github.com/repos/STS78721/SlowSeparation/releases/latest"
+RELEASES_LIST_API_URL = "https://api.github.com/repos/STS78721/SlowSeparation/releases?per_page=10"
 UPDATE_SKIP_TOP = {
     "exefs",
     "romfs",
@@ -106,11 +108,11 @@ def read_app_version() -> str:
 
 
 def version_tuple(ver: str) -> tuple[tuple[int, ...], str]:
-    m = re.search(r"(\d+(?:\.\d+)+)([a-z]*)", str(ver or "").strip().lower())
+    m = re.search(r"(\d+(?:\.\d+)+)(?:([a-z])(?![a-z]))?", str(ver or "").strip().lower())
     if not m:
         return ((), "")
     nums = tuple(int(x) for x in m.group(1).split("."))
-    return (nums, m.group(2))
+    return (nums, m.group(2) or "")
 
 
 def is_same_version(ver1: str, ver2: str) -> bool:
@@ -126,6 +128,58 @@ def is_up_to_date(local_ver: str, remote_tag: str) -> bool:
         return True
     lv, rv = version_tuple(local_ver), version_tuple(remote_tag)
     return bool(lv[0] and rv[0] and lv >= rv)
+
+
+def _find_update_asset(release: dict) -> tuple[str | None, str | None]:
+    tag = (release.get("tag_name") or "").strip()
+    raw_assets = release.get("assets") or []
+    assets = raw_assets.get("links") or [] if isinstance(raw_assets, dict) else raw_assets
+    tag_clean = tag.replace("-", "").replace(".", "")
+    candidates = [
+        f"SteelTemple-FF-SlowSeparation-{tag}-Update.zip",
+        f"SteelTemple-FF-SlowSeparation-{tag_clean}-Update.zip",
+        f"SteelTemple-FF-SlowSeparation-Update-{tag}.zip",
+    ]
+    asset = next(
+        (
+            item
+            for item in assets
+            for cand in candidates
+            if item.get("name", "").casefold() == cand.casefold()
+        ),
+        None,
+    )
+    if not asset:
+        asset = next(
+            (
+                item
+                for item in assets
+                if "update" in item.get("name", "").lower() and item.get("name", "").lower().endswith(".zip")
+            ),
+            None,
+        )
+    if not asset:
+        return (None, None)
+    return (asset.get("name"), asset.get("browser_download_url") or asset.get("url"))
+
+
+def select_latest_release(releases: list[dict]) -> dict | None:
+    """Pick newest non-draft release across regular releases and pre-releases."""
+    candidates = [r for r in (releases or []) if isinstance(r, dict) and not r.get("draft")]
+    if not candidates:
+        return None
+
+    def rank(idx_rel: tuple[int, dict]) -> tuple:
+        idx, rel = idx_rel
+        tag = (rel.get("tag_name") or "").strip()
+        name = (rel.get("name") or "").strip()
+        ver = version_tuple(tag)
+        if not ver[0]:
+            ver = version_tuple(name)
+        _, asset_url = _find_update_asset(rel)
+        return (bool(ver[0]), ver, 1 if asset_url else 0, -idx)
+
+    return max(enumerate(candidates), key=rank)[1]
 
 
 def find_running_ff_processes(root: Path) -> list[dict]:
@@ -234,6 +288,111 @@ def extract_update_archive(archive_path: Path, stage_dir: Path) -> list[str]:
                 shutil.copyfileobj(src, dst)
             written.append(rel.as_posix())
         return written
+
+
+def build_update_relauncher_script(
+    game_dir: Path,
+    stage_dir: Path,
+    title: str,
+    pid: int = 0,
+    restart: bool = True,
+    silent: bool = False,
+) -> str:
+    def ps_quote(value: object) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    game_path = ps_quote(Path(game_dir).resolve())
+    stage_path = ps_quote(Path(stage_dir).resolve())
+    title_text = ps_quote(title)
+    wait_pid_line = f"Wait-Process -Id {int(pid)} -Timeout 15 -ErrorAction SilentlyContinue" if pid and pid > 0 else ""
+    msg_err = (
+        ""
+        if silent
+        else "try { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show(('Update failed and changes were rolled back: ' + $_.Exception.Message), 'Update Failed') | Out-Null } catch {}\n"
+    )
+    msg_ok = (
+        ""
+        if silent
+        else "try { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show(($title + ' installed successfully. The launcher will restart.'), 'Update Complete') | Out-Null } catch {}\n"
+    )
+    restart_block = (
+        "if (Test-Path -LiteralPath $targetLauncher -PathType Leaf) {\n"
+        "    Start-Process -FilePath $targetLauncher -WorkingDirectory $game\n"
+        "}\n"
+        if restart
+        else ""
+    )
+    return f"""
+$ErrorActionPreference = 'Stop'
+$game = {game_path}
+$stage = {stage_path}
+$title = {title_text}
+$targetLauncher = Join-Path $game 'FFLauncher.exe'
+$targetLauncherFull = [IO.Path]::GetFullPath($targetLauncher)
+$logDir = Join-Path $game 'logs'
+$logFile = Join-Path $logDir 'update.log'
+function Write-UpdateLog([string]$msg) {{
+    try {{
+        if (-not (Test-Path -LiteralPath $logDir)) {{ New-Item -ItemType Directory -Force -Path $logDir | Out-Null }}
+        Add-Content -LiteralPath $logFile -Value ('[' + (Get-Date -Format 's') + '] ' + $msg) -ErrorAction SilentlyContinue
+    }} catch {{}}
+}}
+$rollback = Join-Path $stage '_rollback'
+New-Item -ItemType Directory -Force -Path $rollback | Out-Null
+$changed = [System.Collections.Generic.List[string]]::new()
+$appliedCount = 0
+Write-UpdateLog ('Applying update: ' + $title)
+try {{
+    {wait_pid_line}
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline) {{
+        $alive = @(Get-CimInstance Win32_Process -Filter "Name='FFLauncher.exe'" -ErrorAction SilentlyContinue | Where-Object {{
+            $_.ExecutablePath -and [String]::Equals([IO.Path]::GetFullPath($_.ExecutablePath), $targetLauncherFull, [StringComparison]::OrdinalIgnoreCase)
+        }})
+        if ($alive.Count -eq 0) {{ break }}
+        Start-Sleep -Milliseconds 250
+    }}
+    Start-Sleep -Milliseconds 250
+    Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object {{
+        $name = $_.Name
+        if ($name.EndsWith('.tmp') -or $name.EndsWith('.update-new')) {{ return }}
+        if ($_.DirectoryName -eq $stage -and $name.EndsWith('.zip')) {{ return }}
+        $rel = $_.FullName.Substring($stage.Length).TrimStart('\\','/')
+        if ($rel.StartsWith('_rollback', [StringComparison]::OrdinalIgnoreCase)) {{ return }}
+        $source = $_.FullName
+        $target = Join-Path $game $rel
+        $backup = Join-Path $rollback $rel
+        $backupDir = Split-Path -Parent $backup
+        if (-not (Test-Path -LiteralPath $backupDir)) {{ New-Item -ItemType Directory -Force -Path $backupDir | Out-Null }}
+        $targetDir = Split-Path -Parent $target
+        if (-not (Test-Path -LiteralPath $targetDir)) {{ New-Item -ItemType Directory -Force -Path $targetDir | Out-Null }}
+        if (Test-Path -LiteralPath $target -PathType Leaf) {{ Copy-Item -LiteralPath $target -Destination $backup -Force }}
+        $changed.Add($rel)
+        $newFile = $target + '.update-new'
+        for ($attempt = 1; $attempt -le 10; $attempt++) {{
+            try {{
+                Copy-Item -LiteralPath $source -Destination $newFile -Force
+                Move-Item -LiteralPath $newFile -Destination $target -Force
+                break
+            }} catch {{
+                if ($attempt -ge 10) {{ throw }}
+                Start-Sleep -Milliseconds 300
+            }}
+        }}
+        $appliedCount++
+    }}
+    Write-UpdateLog ('Applied ' + $appliedCount + ' files cleanly.')
+}} catch {{
+    Write-UpdateLog ('ERROR: ' + $_.Exception.Message + ' (rolling back ' + $changed.Count + ' files)')
+    for ($i = $changed.Count - 1; $i -ge 0; $i--) {{
+        $rel = $changed[$i]; $target = Join-Path $game $rel; $backup = Join-Path $rollback $rel
+        if (Test-Path -LiteralPath $backup -PathType Leaf) {{ Copy-Item -LiteralPath $backup -Destination $target -Force -ErrorAction SilentlyContinue }}
+        else {{ Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }}
+    }}
+    {msg_err}exit 1
+}}
+{msg_ok}{restart_block}Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+"""
 
 
 def find_icon_ico() -> Path | None:
@@ -1595,7 +1754,7 @@ class FFLauncherApp(tk.Tk):
                     raise RuntimeError("the warm run did not end")
                 time.sleep(1)
             if proc.returncode != 0:
-                raise RuntimeError(f"the warm run ended with exit code {proc.returncode}; see logs\ff.log")
+                raise RuntimeError(f"the warm run ended with exit code {proc.returncode}; see logs\\ff.log")
             for name in ("seed-programs.bin", "seed-answers.bin"):   # --prepare-shaders prefers a seed when present
                 (self.root_dir / name).unlink(missing_ok=True)
             self.after(0, lambda: self.setup_status_var.set("5/5 Building the recorded shaders' pipelines..."))
@@ -1616,9 +1775,24 @@ class FFLauncherApp(tk.Tk):
         rt_lib = self.root_dir / "runtime" / "libffrt.a"
         if not rt_lib.is_file():
             return ""
+        lib_hash = hashlib.sha256(rt_lib.read_bytes()).hexdigest()[:16]
         xlate_id = self.root_dir / "bin" / "ns2_xlate.id"
         xlate_txt = xlate_id.read_text(encoding="utf-8", errors="ignore").strip() if xlate_id.is_file() else ""
-        return f"{self.version}|{rt_lib.stat().st_size}|{xlate_txt}"
+        return f"{self.version}|{rt_lib.stat().st_size}|{lib_hash}|{xlate_txt}"
+
+    def _resolve_packed_romfs(self) -> Path | None:
+        direct = self.root_dir / "romfs_packed"
+        if (direct / "romfs.bin").is_file():
+            return direct
+        mods_c = self.root_dir / "work" / "build" / "ff100" / "modules.c"
+        if mods_c.is_file():
+            txt = mods_c.read_text(encoding="utf-8", errors="ignore")
+            m = re.search(r'rt_default_romfs\[\]\s*=\s*"([^"]+)"', txt)
+            if m:
+                cand = Path(m.group(1).replace("\\\\", "\\"))
+                if (cand / "romfs.bin").is_file():
+                    return cand
+        return None
 
     def _runtime_stamp_path(self) -> Path:
         return self.root_dir / "work" / "build" / "ff100" / ".ff_runtime_stamp"
@@ -1654,13 +1828,13 @@ class FFLauncherApp(tk.Tk):
             return
         exe = self._exe_path()
         exefs = self.root_dir / "exefs"
-        packed_romfs = self.root_dir / "romfs_packed"
+        packed_romfs = self._resolve_packed_romfs()
         gen_dir = self.root_dir / "work" / "generated" / "ff100"
         rt_lib = self.root_dir / "runtime" / "libffrt.a"
         if not (
             exe.is_file()
             and exefs.is_dir()
-            and (packed_romfs / "romfs.bin").is_file()
+            and packed_romfs is not None
             and (gen_dir / "layout.json").is_file()
             and rt_lib.is_file()
         ):
@@ -1680,11 +1854,13 @@ class FFLauncherApp(tk.Tk):
         self.build_state_lbl.configure(text=f"Updating ff.exe for {self.version}…", fg=C_WARN)
         threading.Thread(
             target=self._run_refresh_worker,
-            args=(exefs, packed_romfs, gen_dir, want_stamp),
+            args=(exefs, packed_romfs, gen_dir, want_stamp, have_stamp),
             daemon=True,
         ).start()
 
-    def _run_refresh_worker(self, exefs: Path, packed_romfs: Path, gen_dir: Path, want_stamp: str) -> None:
+    def _run_refresh_worker(
+        self, exefs: Path, packed_romfs: Path, gen_dir: Path, want_stamp: str, have_stamp: str = ""
+    ) -> None:
         err: str | None = None
         try:
             py = self._find_setup_python()
@@ -1720,8 +1896,26 @@ class FFLauncherApp(tk.Tk):
                 if src.is_file():
                     shutil.copy2(src, self.root_dir / fname)
             self._sync_staged_bin_files()
-            # An update can bring a new shader translator, which starts a new cache: warm it again.
-            self._prewarm_shaders(py, env, exefs, packed_romfs, 0, 100)
+            old_xlate = have_stamp.rsplit("|", 1)[-1].strip() if "|" in have_stamp else ""
+            new_xlate = want_stamp.rsplit("|", 1)[-1].strip() if "|" in want_stamp else ""
+            can_reuse_shaders = (
+                bool(old_xlate)
+                and old_xlate == new_xlate
+                and (self.root_dir / "shader-programs.bin").is_file()
+                and (self.root_dir / "pipeline-keys.bin").is_file()
+            )
+            if can_reuse_shaders:
+                subprocess.run(
+                    [str(self._exe_path()), "--prepare-shaders"],
+                    cwd=str(self.root_dir),
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            else:
+                # An update can bring a new shader translator, which starts a new cache: warm it again.
+                self._prewarm_shaders(py, env, exefs, packed_romfs, 0, 100)
             stamp_path = self._runtime_stamp_path()
             stamp_path.parent.mkdir(parents=True, exist_ok=True)
             stamp_path.write_text(want_stamp + "\n", encoding="utf-8")
@@ -1749,45 +1943,42 @@ class FFLauncherApp(tk.Tk):
 
     def _check_release_worker(self) -> None:
         try:
-            req = urllib.request.Request(
-                RELEASES_API_URL,
-                headers={"Accept": "application/vnd.github+json", "User-Agent": "FFLauncher"},
-            )
-            with urllib.request.urlopen(req, timeout=12) as r:
-                data = json.loads(r.read().decode("utf-8"))
+            headers = {"Accept": "application/vnd.github+json", "User-Agent": "FFLauncher"}
+            data: dict | None = None
+            try:
+                req = urllib.request.Request(RELEASES_LIST_API_URL, headers=headers)
+                with urllib.request.urlopen(req, timeout=12) as r:
+                    releases = json.loads(r.read().decode("utf-8"))
+                if isinstance(releases, list):
+                    if not releases:
+                        self.after(
+                            0,
+                            lambda: self._show_release_result(
+                                self.version, f"Your FF SlowSeparation is up to date ({self.version}).", RELEASES_URL, None, None
+                            ),
+                        )
+                        return
+                    data = select_latest_release(releases)
+                    if data is None:
+                        self.after(
+                            0,
+                            lambda: self._show_release_result(
+                                self.version, f"Your FF SlowSeparation is up to date ({self.version}).", RELEASES_URL, None, None
+                            ),
+                        )
+                        return
+            except Exception:
+                data = None
+            if data is None:
+                req = urllib.request.Request(RELEASES_API_URL, headers=headers)
+                with urllib.request.urlopen(req, timeout=12) as r:
+                    data = json.loads(r.read().decode("utf-8"))
             tag = (data.get("tag_name") or "").strip()
             title = (data.get("name") or tag or "Latest FF SlowSeparation release").strip()
             page = data.get("html_url") or (f"{GITHUB_URL}/releases/tag/{tag}" if tag else RELEASES_URL)
             if not tag:
                 raise ValueError("The latest release did not include a version tag.")
-            raw_assets = data.get("assets") or []
-            assets = raw_assets.get("links") or [] if isinstance(raw_assets, dict) else raw_assets
-            tag_clean = tag.replace("-", "").replace(".", "")
-            candidates = [
-                f"SteelTemple-FF-SlowSeparation-{tag}-Update.zip",
-                f"SteelTemple-FF-SlowSeparation-{tag_clean}-Update.zip",
-                f"SteelTemple-FF-SlowSeparation-Update-{tag}.zip",
-            ]
-            asset = next(
-                (
-                    item
-                    for item in assets
-                    for cand in candidates
-                    if item.get("name", "").casefold() == cand.casefold()
-                ),
-                None,
-            )
-            if not asset:
-                asset = next(
-                    (
-                        item
-                        for item in assets
-                        if "update" in item.get("name", "").lower() and item.get("name", "").lower().endswith(".zip")
-                    ),
-                    None,
-                )
-            asset_name = asset.get("name") if asset else None
-            asset_url = (asset.get("browser_download_url") or asset.get("url")) if asset else None
+            asset_name, asset_url = _find_update_asset(data)
             self.after(0, lambda: self._show_release_result(tag, title, page, asset_url, asset_name))
         except Exception as exc:
             detail = str(exc)
@@ -1817,7 +2008,11 @@ class FFLauncherApp(tk.Tk):
             "asset_name": asset_name,
         }
         clean_title = title.split(":", 1)[0].strip()
-        if is_up_to_date(self.version, tag) or is_same_version(self.version, clean_title):
+        if (
+            is_up_to_date(self.version, tag)
+            or is_same_version(self.version, clean_title)
+            or (not version_tuple(tag)[0] and is_up_to_date(self.version, clean_title))
+        ):
             self.update_status.config(text=f"Your FF SlowSeparation is up to date ({self.version})", fg=C_OK)
             self.update_action_btn.pack_forget()
             self.release_btn.pack_forget()
@@ -1841,7 +2036,12 @@ class FFLauncherApp(tk.Tk):
         webbrowser.open(url)
 
     def apply_latest_update(self, auto: bool = False) -> None:
-        if getattr(self, "update_in_progress", False) or not self.latest_release:
+        if (
+            getattr(self, "update_in_progress", False)
+            or getattr(self, "refresh_running", False)
+            or getattr(self, "setup_running", False)
+            or not self.latest_release
+        ):
             return
         warning = game_process_warning(self.root_dir, "applying a launcher/game update")
         if warning:
@@ -1932,57 +2132,7 @@ class FFLauncherApp(tk.Tk):
             self._update_failed(str(exc))
 
     def _start_update_relauncher(self, stage: Path, title: str) -> None:
-        def ps_quote(value: object) -> str:
-            return "'" + str(value).replace("'", "''") + "'"
-
-        game_path = ps_quote(self.root_dir.resolve())
-        stage_path = ps_quote(Path(stage).resolve())
-        title_text = ps_quote(title)
-        script = f"""
-$ErrorActionPreference = 'Stop'
-$game = {game_path}
-$stage = {stage_path}
-$rollback = Join-Path $stage '_rollback'
-New-Item -ItemType Directory -Force -Path $rollback | Out-Null
-$changed = [System.Collections.Generic.List[string]]::new()
-try {{
-    Wait-Process -Id {os.getpid()} -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 800
-    Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object {{
-        $name = $_.Name
-        if ($name.StartsWith('_') -or $name.EndsWith('.tmp') -or $name.EndsWith('.zip')) {{ return }}
-        $rel = $_.FullName.Substring($stage.Length).TrimStart('\\','/')
-        if ($rel.StartsWith('_rollback', [StringComparison]::OrdinalIgnoreCase)) {{ return }}
-        $source = $_.FullName
-        $target = Join-Path $game $rel
-        $backup = Join-Path $rollback $rel
-        $backupDir = Split-Path -Parent $backup
-        if (-not (Test-Path -LiteralPath $backupDir)) {{ New-Item -ItemType Directory -Force -Path $backupDir | Out-Null }}
-        $targetDir = Split-Path -Parent $target
-        if (-not (Test-Path -LiteralPath $targetDir)) {{ New-Item -ItemType Directory -Force -Path $targetDir | Out-Null }}
-        if (Test-Path -LiteralPath $target -PathType Leaf) {{ Copy-Item -LiteralPath $target -Destination $backup -Force }}
-        $changed.Add($rel)
-        $newFile = $target + '.update-new'
-        Copy-Item -LiteralPath $source -Destination $newFile -Force
-        Move-Item -LiteralPath $newFile -Destination $target -Force
-    }}
-}} catch {{
-    try {{ Add-Type -AssemblyName System.Windows.Forms }} catch {{}}
-    for ($i = $changed.Count - 1; $i -ge 0; $i--) {{
-        $rel = $changed[$i]; $target = Join-Path $game $rel; $backup = Join-Path $rollback $rel
-        if (Test-Path -LiteralPath $backup -PathType Leaf) {{ Copy-Item -LiteralPath $backup -Destination $target -Force }}
-        else {{ Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }}
-    }}
-    [System.Windows.Forms.MessageBox]::Show(('Update failed and changes were rolled back: ' + $_.Exception.Message), 'Update Failed') | Out-Null
-    exit 1
-}}
-try {{ Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show(({title_text} + ' installed successfully. The launcher will restart.'), 'Update Complete') | Out-Null }} catch {{}}
-$targetLauncher = Join-Path $game 'FFLauncher.exe'
-if (Test-Path -LiteralPath $targetLauncher -PathType Leaf) {{
-    Start-Process -FilePath $targetLauncher -WorkingDirectory $game
-}}
-Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
-"""
+        script = build_update_relauncher_script(self.root_dir, stage, title, pid=os.getpid(), restart=True, silent=False)
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         flags = getattr(subprocess, "DETACHED_PROCESS", 0)
         subprocess.Popen(

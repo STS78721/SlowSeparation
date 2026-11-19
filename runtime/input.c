@@ -464,14 +464,29 @@ static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     return 1;
 }
 
+// Under lock, state 1: rising edge of the center PS/Guide/Home button or PS4/PS5 touchpad click toggles the F1 menu.
+static int pad_menu_button(void) {
+    static int guide_held;
+    int down = (pad && SDL_GamepadConnected(pad)) &&
+               (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_GUIDE) ||
+                SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_TOUCHPAD));
+    int edge = down && !guide_held;
+    guide_held = down;
+    return edge;
+}
+
 static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     uint64_t b = 0;
     int32_t sl[2] = {0, 0}, sr[2] = {0, 0};
+    int guide_toggle = 0;
     plat_mutex_lock(&lock);
     if (!state) start();
     if (state > 0) {
         binds_refresh();
-        if (state == 1) pad_read(&b, sl, sr);
+        if (state == 1) {
+            pad_read(&b, sl, sr);
+            guide_toggle = pad_menu_button();
+        }
         if (ikb_foreground()) {
             uint8_t down[KEY_COUNT] = {0};
             // Mouse buttons count only while the cursor is captured, and a button already held when the capture began
@@ -499,10 +514,10 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
     }
     script_apply(&b, sl, sr);
     rec_apply(b, sl, sr);
-    // Minus and Plus held together (gamepad or keys) open or close the menu and never reach the game
+    // Minus and Plus held together (gamepad or keys), or the center PS/Guide/Touchpad button, open or close the menu
     static int combo_held;
     int32_t st[4] = {sl[0], sl[1], sr[0], sr[1]};
-    int toggle = input_menu_gate(&combo_held, menu_is_open(), &b, st);
+    int toggle = input_menu_gate(&combo_held, menu_is_open(), &b, st) || guide_toggle;
     static int overlay_held;   // L3+R3 step the performance overlay (F10)
     int overlay = input_overlay_gate(&overlay_held, &b);
     sl[0] = st[0], sl[1] = st[1], sr[0] = st[2], sr[1] = st[3];
@@ -562,7 +577,9 @@ int input_pad_read(uint64_t *buttons, int32_t *lx, int32_t *ly) {
     if (!state) start();
     if (state > 0) binds_refresh();
     int ok = state == 1 && pad_read(&b, sl, sr);
+    int guide_toggle = ok ? pad_menu_button() : 0;
     plat_mutex_unlock(&lock);
+    if (guide_toggle) menu_toggle();
     *buttons = b;
     *lx = sl[0];
     *ly = sl[1];

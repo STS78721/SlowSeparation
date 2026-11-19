@@ -19,7 +19,8 @@ enum {
     VK_EXEC_DIRTY_DEPTH_BIAS = 1 << 2,   // polygon offset
     VK_EXEC_DIRTY_BLEND_CONST = 1 << 3,
     VK_EXEC_DIRTY_STENCIL = 1 << 4,      // compare and write masks, references
-    VK_EXEC_DIRTY_ALL = (1 << 5) - 1,
+    VK_EXEC_DIRTY_DEPTH_BOUNDS = 1 << 5, // hardware depth-bounds test
+    VK_EXEC_DIRTY_ALL = (1 << 6) - 1,
 };
 
 // One render target of OP_SET_RT, resolved to its vk_texture.c image for the current command buffer.
@@ -64,6 +65,8 @@ typedef struct VkExec {
     p_scissor scissor;                   // OP_SCISSOR (scissor 0)
     int has_scissor;                     // a scissor was set; else unbounded
     float depth_range[2];                // OP_DEPTH_RANGE: overrides the viewports' near and far
+    int depth_bounds_en;                 // OP_DEPTH_BOUNDS: hardware depth-bounds test enable
+    float depth_bounds[2];               // OP_DEPTH_BOUNDS: [min, max]
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];   // OP_STENCIL per face (0 front, 1 back): compare mask, write mask, ref
     float point_size;                    // OP_BIND_STATE kind 6: NVN point size for the support buffer; 0 = never set = 1
     p_poly_offset poly_offset;           // OP_POLY_OFFSET: depth bias factor, units, clamp

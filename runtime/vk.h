@@ -45,7 +45,8 @@ typedef struct VkCtx {
         gpu_is_rx9000,
         gpu_is_intel,
         gpu_is_intel_arc,
-        has_astc_ldr;                       // textureCompressionASTC_LDR (enabled when reported)
+        has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
+        has_depth_bounds;                   // VkPhysicalDeviceFeatures.depthBounds (enabled when reported)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -410,6 +411,10 @@ uint64_t vk_texture_last_write(const tex_t *t);    // timeline value of the newe
 size_t vk_texture_texel_span(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint64_t row, uint64_t img);   // bytes ReadTexels spans; 0 for a bad region
 int vk_texture_small_dirty(void);                   // a small mirrored target holds GPU texels its storage lacks
 void vk_texture_write_back_small(uint64_t fence);   // writes those rendered by work up to fence back to storage
+// End of a submission's command buffer (vk_exec.c record_impl): records GPU -> staging copies for small mirrored
+// render targets written in `fence` and queues their host write-back on `fence`'s completion callback. Returns the
+// number of Vulkan commands recorded.
+int vk_texture_small_wb_end(VkCommandBuffer cb, uint64_t fence);
 void vk_texture_debug(const VkTexImage *img, uint32_t *uploads, int *last_change, int *pages_written);   // vk_dump
 int vk_texture_slot_swz(const dpool_ref *pool, int id, uint8_t swz[4]);
 int vk_texture_read_image(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,

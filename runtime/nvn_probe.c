@@ -450,6 +450,9 @@ static uint64_t record_all(void) {
     REC(OP_COPY_T2T, CALL(nvnCommandBufferCopyTextureToTexture, U(c), U(&tex1), 0, U(&rg), U(&tex2), 0, U(&rg2), 0));
     REC(OP_CLEAR_TEX, CALL(nvnCommandBufferClearTexture, U(c), U(&tex2), 0, U(&rg2), U(rgba), 0xf));
     REC(OP_DEPTH_CLAMP, CALL(nvnCommandBufferSetDepthClamp, U(c), 1));
+    fv(0, 0.125f);
+    fv(1, 0.875f);
+    REC(OP_DEPTH_BOUNDS, CALL(nvnCommandBufferSetDepthBounds, U(c), 1));
     REC(OP_RENDER_ENABLE, CALL(nvnCommandBufferSetRenderEnable, U(c), 0));
     REC(OP_RASTER_DISCARD, CALL(nvnCommandBufferSetRasterizerDiscard, U(c), 1));
     REC(OP_RENDER_COND, CALL(nvnCommandBufferSetRenderEnableConditional, U(c), 1, 0xb000));
@@ -670,6 +673,11 @@ static void parse_all(uint64_t h) {
             break;
         }
         case OP_DEPTH_CLAMP: CHECK(((const p_flag *)a)->value == 1, "DEPTH_CLAMP payload"); break;
+        case OP_DEPTH_BOUNDS: {
+            const p_depth_bounds *p = a;
+            CHECK(p->enable == 1 && p->lo == 0.125f && p->hi == 0.875f, "DEPTH_BOUNDS payload");
+            break;
+        }
         case OP_RENDER_ENABLE: CHECK(((const p_flag *)a)->value == 0, "RENDER_ENABLE payload"); break;
         case OP_RASTER_DISCARD: CHECK(((const p_flag *)a)->value == 1, "RASTER_DISCARD payload"); break;
         case OP_RENDER_COND: {

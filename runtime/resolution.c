@@ -628,7 +628,8 @@ static int ff_is_aux_buffer(const char *name) {
     if (ff_strcasestr(name, "gtao res") && !ff_strcasestr(name, "depthres")) return 1;
     static const char *const kAux[] = {
         "shadow", "cube", "dummy", "temp", "mip", "bloom", "streak", "godray",
-        "flare", "sao", "blur", "fog", "lut", "tile", "exposure", "scaledown", "bilateral",
+        "flare", "sao", "blur", "fog", "lut", "tile", "exposure", "scaledown",
+        "downsample", "downsize", "downscale", "pingpong", "bilateral",
     };
     for (size_t i = 0; i < sizeof kAux / sizeof *kAux; i++) {
         if (ff_strcasestr(name, kAux[i])) return 1;

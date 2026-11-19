@@ -5,6 +5,18 @@ below come from the shared Universal NS2 to PC history this project is built on.
 
 ---
 
+## [Alpha 0.1.1] - 2026-11-19
+
+### ⚡ Locked 4K 60 FPS Uplift & Updater Reliability
+- **Inline end-of-submission GPU readback (`runtime/vk_texture.c`, `runtime/vk_exec.c`):** small mirrored render targets (such as 128-byte auto-exposure) now copy into a host-cached staging buffer inline at submission end and write back on fence completion, eliminating per-frame `up_wait` CPU sync stalls (`7.7–8.4 ms -> 0.00 ms`) and lifting native 4K 1:1 from `52–53 fps` to a locked **`60.0 fps`** with `31–35%` CPU pacing headroom.
+- **Shared-page texture content hashing (`runtime/vk_texture.c`):** small (`<= 512 KiB`) tracked textures dirtied only by neighbor CPU buffers or small write-backs on the same 4 KiB OS page are xxHash64-checked before re-uploading (`TOTK_TEX_HASH`), dropping steady-race re-uploads to **`0`**.
+- **Hardware depth bounds (`runtime/vk_pipeline.c`, `runtime/vk_exec_draw.c`, `runtime/vk_rec.c`, `runtime/nvn_api_cmd.c`):** implemented `nvnCommandBufferSetDepthBounds` via Vulkan dynamic state (`VK_DYNAMIC_STATE_DEPTH_BOUNDS*`), gated safely on `VkPhysicalDeviceFeatures.depthBounds`.
+- **4K mid-race pause crash fixed (`runtime/resolution.c`):** mark `downsample` / `downsize` / `downscale` / `pingpong` targets as `aux/skip` so `DownsampleTextureToColorBuffer` stays `1920x1080` instead of overflowing the compressible render-target pool at 4K.
+- **PS4/PS5 center button F1 menu toggle (`runtime/input.c`):** pressing the PlayStation / Guide / Home button (`SDL_GAMEPAD_BUTTON_GUIDE`) or PS4/PS5 touchpad click (`SDL_GAMEPAD_BUTTON_TOUCHPAD`) now opens and closes the F1 settings menu cleanly (alongside Minus + Plus).
+- **`FFLauncher` auto-updater & rebuild fixes (`launcher/FFLauncher.py`):** detects both regular and pre-release GitHub Releases (`select_latest_release`), stops skipping `_`-prefixed Python runtime files (`__init__.py`, `_*.pyd`) in `Update.zip` replacement, waits cleanly on PyInstaller's parent process lock with retries and `logs/update.log`, and resolves external `romfs_packed` paths from `modules.c` so `ff.exe` auto-rebuilds after updates without a 50s warm rerun when `ns2_xlate.id` is unchanged.
+
+---
+
 ## [Alpha 0.1.0a] - 2026-11-19
 
 ### 🏁 First SteelTemple SlowSeparation release (Fast Fusion 1.0.0)
