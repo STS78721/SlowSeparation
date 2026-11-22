@@ -5,6 +5,13 @@ below come from the shared Universal NS2 to PC history this project is built on.
 
 ---
 
+## [Alpha 0.1.2] - 2026-11-22
+
+### 🎨 Lighting, Contrast & sRGB Presentation Fix
+- **Fixed overly dark / crushed lighting and menu contrast (`runtime/vk_color.c`, `runtime/vk_fsr.c`):** Fast Fusion presents from an `_SRGB` texture into a `_UNORM` Vulkan swapchain. The present color-grading and FSR passes (as well as the fallback bilinear blit) previously sampled or blitted the source image as `_SRGB`, causing Vulkan hardware to decode sRGB to linear without re-encoding back to sRGB and crushing midtone brightness (`~0.31` → `~0.08`). `_SRGB` present sources are now sampled through a matching `_UNORM` view so raw sRGB-encoded values pass intact into the swapchain across FSR, bilinear, and custom color-grading modes (fixes [#1](https://github.com/STS78721/SlowSeparation/issues/1)).
+
+---
+
 ## [Alpha 0.1.1] - 2026-11-19
 
 ### ⚡ Locked 4K 60 FPS Uplift & Updater Reliability

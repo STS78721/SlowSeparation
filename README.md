@@ -11,7 +11,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#-requirements)
 [![Vulkan](https://img.shields.io/badge/Vulkan-1.3-AC162C?style=for-the-badge&logo=vulkan&logoColor=white)](#-under-the-hood)
 [![Game version](https://img.shields.io/badge/game-1.0.0-40E0FF?style=for-the-badge&labelColor=0B0A1F)](#-quick-start)
-[![Release](https://img.shields.io/badge/release-Alpha%200.1.1-FF2E88?style=for-the-badge&labelColor=0B0A1F)](https://github.com/STS78721/SlowSeparation/releases)
+[![Release](https://img.shields.io/badge/release-Alpha%200.1.2-FF2E88?style=for-the-badge&labelColor=0B0A1F)](https://github.com/STS78721/SlowSeparation/releases)
 [![License](https://img.shields.io/badge/license-GPL--3.0%2B-blue?style=for-the-badge)](#-credits--licence)
 
 **[Quick start](#-quick-start)** · **[Features](#-highlights)** · **[Status](#-status)** · **[How it works](#-under-the-hood)** · **[Changelog](CHANGELOG.md)** · **[Credits](#-credits--licence)**
@@ -24,7 +24,7 @@
 > **No game files are included.** You need your own legally dumped copy of **Fast Fusion (1.0.0)**: `exefs` and `romfs`. This repository contains only the recompiler, the runtime, the launcher, and the setup tools.
 
 > [!NOTE]
-> **Current release: `Alpha 0.1.1`**, delivering locked **60 FPS at native 4K 1:1** and hardened `FFLauncher` self-updates. It starts on a balanced baseline (`1920x1080` windowed, Original internal resolution, AMD FSR, Frame Generation Off, 60 FPS) so every system boots smoothly. Raise the internal resolution up to native 4K anytime in `FFLauncher` or in-game (`F1`). This is an alpha: expect rough edges outside the tested races.
+> **Current release: `Alpha 0.1.2`**, fixing sRGB presentation gamma/lighting contrast alongside locked **60 FPS at native 4K 1:1** and hardened `FFLauncher` self-updates. It starts on a balanced baseline (`1920x1080` windowed, Original internal resolution, AMD FSR, Frame Generation Off, 60 FPS) so every system boots smoothly. Raise the internal resolution up to native 4K anytime in `FFLauncher` or in-game (`F1`). This is an alpha: expect rough edges outside the tested races.
 
 ## ✨ Highlights
 
@@ -73,8 +73,8 @@ Works out of the box with Xbox, DualSense, Switch / Switch 2 Pro controllers, an
 
 **1. Install FF-SlowSeparation**
 
-Download the latest **`Alpha 0.1.1`** release from the **[Releases page](https://github.com/STS78721/SlowSeparation/releases)**:
-- Run **`SteelTemple-FF-SlowSeparation-Alpha-0.1.1-Full-Setup-Wizard.exe`** (no administrator rights needed), or extract **`Portable-StandAlone.zip`**.
+Download the latest **`Alpha 0.1.2`** release from the **[Releases page](https://github.com/STS78721/SlowSeparation/releases)**:
+- Run **`SteelTemple-FF-SlowSeparation-Alpha-0.1.2-Full-Setup-Wizard.exe`** (no administrator rights needed), or extract **`Portable-StandAlone.zip`**.
 
 **2. Set up from your Fast Fusion 1.0.0 dump**
 
@@ -141,7 +141,7 @@ flowchart LR
 - **GPU:** Switch 2 NVN 2 commands translate onto **Vulkan 1.3** with Graphics Pipeline Libraries, Ampere (`SM86`) shader lowering, AMD FSR 1.0, and frame-generation pacing.
 - **Resolution:** [`runtime/resolution.c`](runtime/resolution.c) wraps the game's canvas setters, camera frame-buffer scale, render-target builders, and DLSS setup so the race renders at the chosen size, 1:1.
 - **Icons:** the SlowSeparation icons are original art drawn by [`tools/make_ff_icons.py`](tools/make_ff_icons.py); no game artwork is used.
-- **Release versioning:** [`VERSION`](VERSION) drives the version label across the Setup Wizard, `FFLauncher`, Windows Installed Apps, and the F1 menu (`Alpha 0.1.1`), alongside [`CHANGELOG.md`](CHANGELOG.md).
+- **Release versioning:** [`VERSION`](VERSION) drives the version label across the Setup Wizard, `FFLauncher`, Windows Installed Apps, and the F1 menu (`Alpha 0.1.2`), alongside [`CHANGELOG.md`](CHANGELOG.md).
 
 ## 🙏 Credits & licence
 
