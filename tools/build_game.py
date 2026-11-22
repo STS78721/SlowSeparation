@@ -362,6 +362,7 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
             'f_700006ec74', 'f_70000f0960',
             'f_70001080b0', 'f_7000108170',
             'f_700002c764',
+            'f_70000fec98', 'f_700011e8c0',
         ):
             ldflags.append(f'-Wl,--wrap,{sym}')
     lines = [

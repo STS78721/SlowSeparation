@@ -38,6 +38,8 @@
 #include "cfg.h"
 #include "game_profile.h"
 #include "host.h"
+#include "nvn_obj.h"
+#include "nvn_tex.h"
 #include "platform/platform.h"
 
 #define BASE_W 1920
@@ -430,10 +432,16 @@ extern void __real_f_70000f0960(Cpu *c) __attribute__((weak));
 extern void __real_f_70001080b0(Cpu *c) __attribute__((weak));
 extern void __real_f_7000108170(Cpu *c) __attribute__((weak));
 extern void __real_f_700002c764(Cpu *c) __attribute__((weak));
+extern void __real_f_70000fec98(Cpu *c) __attribute__((weak));
+extern void __real_f_700011e8c0(Cpu *c) __attribute__((weak));
+
+static int ff_is_game(void) {
+    const RtGameProfile *gp = game_profile();
+    return gp && gp->short_name && !strcmp(gp->short_name, "ff");
+}
 
 int res_ff_enabled(void) {
-    const RtGameProfile *gp = game_profile();
-    return gp && gp->short_name && !strcmp(gp->short_name, "ff") && cfg_bool("TOTK_RES_HOOK");
+    return ff_is_game() && cfg_bool("TOTK_RES_HOOK");
 }
 
 static int ff_streqi(const char *a, const char *b) {
@@ -761,4 +769,175 @@ void __wrap_f_700002c764(Cpu *c) {
         }
     }
     ff_call_real(__real_f_700002c764, 0x700002c764ull, c);
+}
+
+static uint64_t ff_guest_call3(Cpu *c, uint64_t fn_addr, uint64_t a0, uint64_t a1, uint64_t a2) {
+    uint64_t saved_x[19];
+    memcpy(saved_x, c->x, sizeof saved_x);
+    uint64_t saved_x30 = c->x[30];
+    uint64_t saved_pc = c->pc;
+    uint64_t saved_nzcv = c->nzcv;
+    c->x[0] = a0;
+    c->x[1] = a1;
+    c->x[2] = a2;
+    c->pc = fn_addr;
+    rt_dispatch(c);
+    uint64_t ret = c->x[0];
+    memcpy(c->x, saved_x, sizeof saved_x);
+    c->x[30] = saved_x30;
+    c->pc = saved_pc;
+    c->nzcv = saved_nzcv;
+    return ret;
+}
+
+static uint64_t ff_video_buffers_target_bytes(void) {
+    const char *ov = cfg_get("FF_VIDEO_BUFFERS_MB");
+    if (ov && *ov) {
+        char *end = NULL;
+        unsigned long long mb = strtoull(ov, &end, 0);
+        if (end != ov && !*end && mb >= 256ull && mb <= 4096ull)
+            return (mb << 20) & ~0xffffull;
+    }
+    if (!res_ff_enabled()) return 0x70000000ull;
+    uint32_t cw = 0, ch = 0, sw = 0, sh = 0;
+    ff_get_target_resolutions(&cw, &ch, &sw, &sh);
+    uint64_t cpx = (uint64_t)cw * (uint64_t)ch;
+    uint64_t spx = (uint64_t)sw * (uint64_t)sh;
+    uint64_t px = cpx > spx ? cpx : spx;
+    if (px <= 1920ull * 1080ull) return 0x70000000ull;   // 1792 MiB (original baseline)
+    if (px <= 2560ull * 1440ull) return 0x90000000ull;   // 2304 MiB (+512 MiB for 1440p)
+    if (px <= 3840ull * 2160ull) return 0xC0000000ull;   // 3072 MiB (+1280 MiB for 4K)
+    return 0xE0000000ull;                                // 3584 MiB (+1792 MiB above 4K)
+}
+
+// Fast Fusion allocates its fixed 1792 MiB 'video:buffers' render-target pool once in f_700011d878
+// (calling FreeListHeap::Init at lr=0x700011d940). At 1440p/4K, rapid end-of-race transitions can
+// allocate a new screen's render targets before the 2-frame deferred-free queue drains, exhausting
+// or fragmenting 1792 MiB. Resize the pool proportionally above 1080p (backing storage is GPU-only
+// CPU_NO_ACCESS|COMPRESSIBLE and stays lazily unimported on Vulkan, so physical RAM/VRAM only
+// reflect live VMA images).
+void __wrap_f_70000fec98(Cpu *c) {
+    if (ff_is_game() && c->x[30] == 0x700011d940ull && c->x[2] == 0x70000000ull && c->x[1] != 0) {
+        uint64_t want = ff_video_buffers_target_bytes();
+        if (want != 0x70000000ull && plat_mem_readable(0x70006ab310ull, 8)) {
+            uint64_t g_ptr = LD64(0x70006ab310ull);
+            uint64_t eng = (g_ptr && plat_mem_readable(g_ptr, 8)) ? LD64(g_ptr) : 0;
+            uint64_t vt = (eng && plat_mem_readable(eng, 8)) ? LD64(eng) : 0;
+            uint64_t get_heap = (vt && plat_mem_readable(vt + 0xe0ull, 8)) ? LD64(vt + 0xe0ull) : 0;
+            if (get_heap) {
+                uint64_t main_heap = ff_guest_call3(c, get_heap, eng, 0, 0);
+                uint64_t hvt = (main_heap && plat_mem_readable(main_heap, 8)) ? LD64(main_heap) : 0;
+                uint64_t fn_alloc = (hvt && plat_mem_readable(hvt + 0x10ull, 8)) ? LD64(hvt + 0x10ull) : 0;
+                uint64_t fn_free = (hvt && plat_mem_readable(hvt + 0x30ull, 8)) ? LD64(hvt + 0x30ull) : 0;
+                if (fn_alloc && fn_free) {
+                    uint64_t old_mem = c->x[1];
+                    ff_guest_call3(c, fn_free, main_heap, old_mem, 0);
+                    uint64_t tries[4] = {want, 0xA0000000ull, 0x88000000ull, 0x70000000ull};
+                    uint64_t new_mem = 0, got_sz = 0;
+                    for (int i = 0; i < 4; i++) {
+                        uint64_t sz = tries[i];
+                        if (i > 0 && sz >= want) continue;
+                        new_mem = ff_guest_call3(c, fn_alloc, main_heap, sz, 0x1000ull);
+                        if (new_mem) {
+                            got_sz = sz;
+                            break;
+                        }
+                    }
+                    if (new_mem) {
+                        c->x[1] = new_mem;
+                        c->x[2] = got_sz;
+                        rt_log("ff: video:buffers pool 1792 -> %llu MiB (base=%#llx)",
+                               (unsigned long long)(got_sz >> 20), (unsigned long long)new_mem);
+                    } else {
+                        rt_log("ff: video:buffers resize failed; could not reallocate pool");
+                    }
+                }
+            }
+        }
+    }
+    ff_call_real(__real_f_70000fec98, 0x70000fec98ull, c);
+}
+
+// Guard AllocTextureMemory (f_700011e8c0) against NULL dereference if video:buffers ever fills or
+// fragments despite resizing: check the free list under the pool's mutex, and if no free block fits,
+// temporarily clear NVN_TEXTURE_FLAGS_COMPRESSIBLE so f_700011e8c0 routes the allocation into the
+// unlimited growing 'video' multi-pool (nvnMgr+0x130), then restore COMPRESSIBLE before returning
+// so nvnTextureInitialize keeps the render target GPU-only (non-mirrored) in Vulkan.
+void __wrap_f_700011e8c0(Cpu *c) {
+    if (!ff_is_game()) {
+        ff_call_real(__real_f_700011e8c0, 0x700011e8c0ull, c);
+        return;
+    }
+    uint64_t nvn_mgr = c->x[0];
+    uint64_t tb_addr = c->x[1];
+    int fast_inline = 0;
+    if (plat_mem_readable(0x70006aba48ull, 8)) {
+        uint64_t fp = LD64(0x70006aba48ull);
+        if (fp && plat_mem_readable(fp, 4)) fast_inline = LD32(fp) != 0;
+    }
+    if (!fast_inline && nvn_mgr && tb_addr &&
+        plat_mem_readable(tb_addr, sizeof(tex_builder_t)) &&
+        plat_mem_readable(nvn_mgr + 0x220ull, 0x180u)) {
+        tex_builder_t *tb = (tex_builder_t *)(uintptr_t)tb_addr;
+        int orig_flags = tb->d.flags;
+        int wants_vb = (orig_flags & 0x8) && !(orig_flags & 0x2) && !(orig_flags & 0x40);
+        if (wants_vb) {
+            nvn_texlayout L;
+            nvn_tex_layout(&tb->d, &L);
+            uint64_t req_size = L.size ? L.size : 4ull;
+            uint32_t req_align = L.align > 1u ? L.align : 1u;
+            uint64_t vb = nvn_mgr + 0x220ull;
+
+            static PlatMutex g_ff_vb_guard = PLAT_MUTEX_INIT;
+            plat_mutex_lock(&g_ff_vb_guard);
+
+            int have_locks = rt_dispatch_lookup(0x70000fe494ull) != NULL &&
+                             rt_dispatch_lookup(0x70000fe4a8ull) != NULL;
+            if (have_locks) ff_guest_call3(c, 0x70000fe494ull, vb, 0, 0);
+
+            uint64_t pool_base = LD64(vb + 0xb0ull);
+            uint64_t used = LD64(vb + 0x88ull);
+            uint64_t total = LD64(vb + 0xa8ull);
+            uint64_t cur = LD64(vb + 0x178ull);
+            uint64_t max_free = 0;
+            int fits = 0;
+            for (int i = 0; cur && i < 65536 && plat_mem_readable(cur, 0x28u); i++) {
+                uint32_t fl = LD32(cur + 0x20ull);
+                if (!((fl >> 31) & 1u)) {
+                    uint64_t start = LD64(cur + 0x0ull);
+                    uint64_t sz = LD64(cur + 0x18ull);
+                    if (sz > max_free) max_free = sz;
+                    uint64_t rem = (start - pool_base) % req_align;
+                    uint64_t pad = rem ? (req_align - rem) : 0ull;
+                    if (sz >= req_size && sz - req_size >= pad) {
+                        fits = 1;
+                        break;
+                    }
+                }
+                cur = LD64(cur + 0x8ull);
+            }
+
+            if (have_locks) ff_guest_call3(c, 0x70000fe4a8ull, vb, 0, 0);
+
+            if (!fits) {
+                static uint32_t n_spills = 0;
+                uint32_t sc = ++n_spills;
+                if (sc <= 16u || (sc % 64u) == 0u) {
+                    rt_log("ff: video:buffers pressure (need %.2f MiB, max_free=%.2f MiB, used=%.1f/%.1f MiB, %ux%u fmt=%#x); spilling #%u to video multi-pool",
+                           req_size / 1048576.0, max_free / 1048576.0,
+                           used / 1048576.0, total / 1048576.0,
+                           tb->d.width, tb->d.height, tb->d.format, sc);
+                }
+                tb->d.flags = orig_flags & ~NVN_TEXTURE_FLAGS_COMPRESSIBLE;
+                ff_call_real(__real_f_700011e8c0, 0x700011e8c0ull, c);
+                tb->d.flags = orig_flags;
+            } else {
+                ff_call_real(__real_f_700011e8c0, 0x700011e8c0ull, c);
+            }
+
+            plat_mutex_unlock(&g_ff_vb_guard);
+            return;
+        }
+    }
+    ff_call_real(__real_f_700011e8c0, 0x700011e8c0ull, c);
 }

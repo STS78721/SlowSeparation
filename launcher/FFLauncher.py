@@ -43,7 +43,7 @@ from ff_dump import (
 
 APP_TITLE = "FF SlowSeparation"
 APP_SUBTITLE = "Fast Fusion  ·  Native Windows PC Recompilation"
-DEFAULT_VERSION = "Alpha 0.1.2a"
+DEFAULT_VERSION = "Alpha 0.1.2b"
 GITHUB_URL = "https://github.com/STS78721/SlowSeparation"
 RELEASES_URL = GITHUB_URL + "/releases"
 RELEASES_API_URL = "https://api.github.com/repos/STS78721/SlowSeparation/releases/latest"

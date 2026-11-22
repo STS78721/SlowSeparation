@@ -5,6 +5,16 @@ below come from the shared Universal NS2 to PC history this project is built on.
 
 ---
 
+## [Alpha 0.1.2b] - 2026-11-23
+
+### 🛠️ End-of-Race Rapid-Confirm Crash Fix
+- **Fixed crash when pressing `A` quickly at the end of a race (`runtime/resolution.c`, `tools/build_game.py`):**
+  - At 1440p and 4K, transitioning quickly out of a race allocates the next screen's render targets before the game's 2-frame deferred-free queue drains, which could exhaust or fragment the fixed `1,792 MiB` compressible render-target pool (`video:buffers`) and trigger a null-pointer crash in `AllocTextureMemory`.
+  - **Resolution-aware render-target pool sizing:** Automatically scales the `video:buffers` address pool above 1080p (`2,304 MiB` at 1440p, `3,072 MiB` at 4K, `3,584 MiB` above 4K) while keeping `1,792 MiB` unchanged at 1080p and below. Because the pool stays lazily unimported on Vulkan (`CPU_NO_ACCESS|COMPRESSIBLE`), physical RAM and VRAM usage still reflect only live rendered textures.
+  - **OOM/fragmentation spill guard:** Wraps `AllocTextureMemory` to check free-list capacity before allocation; if `video:buffers` ever fills or fragments, the texture cleanly spills into the game's dynamically growing `'video'` multi-pool while keeping its GPU-only (`COMPRESSIBLE`) Vulkan flags intact so it never crashes.
+
+---
+
 ## [Alpha 0.1.2a] - 2026-11-22
 
 ### 🔧 `FFLauncher` Auto-Update Fix
