@@ -5,6 +5,18 @@ below come from the shared Universal NS2 to PC history this project is built on.
 
 ---
 
+## [Alpha 0.1.2a] - 2026-11-22
+
+### 🔧 `FFLauncher` Auto-Update Fix
+- **Fixed `FFLauncher` auto-updater silently exiting and stacking `.ff-update-*` folders (`launcher/FFLauncher.py`):**
+  - Replaced `DETACHED_PROCESS` (which causes Windows PowerShell 5.1 to exit silently with code `0` without running the script) with `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` running a temporary UTF-8 BOM `.ps1` script from `%TEMP%` that self-deletes on completion.
+  - Added delta staging during archive validation so unchanged toolchain files are skipped instead of re-copied, dropping apply time to under 1 second.
+  - Added `\\?\` extended-length path support (paths over 260 characters and non-ASCII/accented folders), atomic swap with 5-second lock retries covering both backup and rename, clean rollback + stage cleanup on error, and automatic removal of leftover `.ff-update-*` folders on startup.
+  - Replaced the blocking hidden completion popup with an immediate launcher restart and status banner, plus a failure marker (`logs/update_failed.json`) to prevent auto-update retry loops.
+- **Cleaner release packages (`tools/build_ff_release.py`):** Run staged Python verification with `-B` so release zips do not accumulate extra timestamp-varying `.pyc` caches.
+
+---
+
 ## [Alpha 0.1.2] - 2026-11-22
 
 ### 🎨 Lighting, Contrast & sRGB Presentation Fix

@@ -43,7 +43,7 @@ from ff_dump import (
 
 APP_TITLE = "FF SlowSeparation"
 APP_SUBTITLE = "Fast Fusion  ·  Native Windows PC Recompilation"
-DEFAULT_VERSION = "Alpha 0.1.2"
+DEFAULT_VERSION = "Alpha 0.1.2a"
 GITHUB_URL = "https://github.com/STS78721/SlowSeparation"
 RELEASES_URL = GITHUB_URL + "/releases"
 RELEASES_API_URL = "https://api.github.com/repos/STS78721/SlowSeparation/releases/latest"
@@ -238,10 +238,98 @@ def game_process_warning(root: Path, action: str) -> str | None:
     return "Fast Fusion (ff.exe) is currently running:\n" + "\n".join(details) + f"\n\nClose the game before {action}."
 
 
-def extract_update_archive(archive_path: Path, stage_dir: Path) -> list[str]:
-    """Stage safe files from the official SlowSeparation Update.zip (flat or FF-SlowSeparation/ nested)."""
+def _win_long_path(path: Path) -> Path:
+    """Prefix deep Windows paths with \\\\?\\ so file operations never hit the 260-char MAX_PATH limit."""
+    p = Path(path)
+    if os.name != "nt":
+        return p
+    raw = str(p.resolve(strict=False))
+    if raw.startswith("\\\\?\\"):
+        return Path(raw)
+    if len(raw) < 240:
+        return Path(raw)
+    if raw.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + raw[2:])
+    return Path("\\\\?\\" + raw)
+
+
+def _is_updater_pid_alive(pid: int) -> bool:
+    if pid <= 0 or os.name != "nt":
+        return False
+    try:
+        r = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f"$p = Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue; if ($p -and $p.ProcessName -match 'powershell|pwsh') {{ 'ALIVE' }}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return r.returncode == 0 and "ALIVE" in (r.stdout or "")
+    except Exception:
+        return False
+
+
+def cleanup_stale_update_dirs(root: Path) -> int:
+    """Remove leftover .ff-update-* staging folders and temp swap files when no updater is active."""
+    root = Path(root)
+    if not root.is_dir():
+        return 0
+    lock_file = root / "logs" / ".ff-update-active.pid"
+    if lock_file.is_file():
+        try:
+            pid = int(lock_file.read_text(encoding="utf-8", errors="ignore").strip() or "0")
+            if _is_updater_pid_alive(pid):
+                return 0
+        except Exception:
+            pass
+        try:
+            lock_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    removed = 0
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        name = entry.name
+        if entry.is_dir() and name.startswith(".ff-update-"):
+            try:
+                rmtree_retry(_win_long_path(entry))
+                removed += 1
+            except Exception:
+                shutil.rmtree(_win_long_path(entry), ignore_errors=True)
+                if not entry.exists():
+                    removed += 1
+        elif entry.is_file() and (".update-old" in name or name.endswith(".update-new")):
+            try:
+                entry.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def extract_update_archive(
+    archive_path: Path,
+    stage_dir: Path,
+    existing_root: Path | None = None,
+) -> list[str]:
+    """Stage safe files from the official SlowSeparation Update.zip (flat or FF-SlowSeparation/ nested).
+
+    When existing_root is provided, validates the full archive (including CRC and required FFLauncher.exe)
+    and only stages files that are missing or differ from existing_root so updates apply in seconds.
+    """
     archive_path, stage_dir = Path(archive_path), Path(stage_dir)
-    selected: dict[str, zipfile.ZipInfo] = {}
+    existing_base = Path(existing_root).resolve() if existing_root is not None else None
+    selected: dict[str, tuple[tuple[str, ...], zipfile.ZipInfo]] = {}
     with zipfile.ZipFile(archive_path) as archive:
         bad_member = archive.testzip()
         if bad_member:
@@ -268,24 +356,28 @@ def extract_update_archive(archive_path: Path, stage_dir: Path) -> list[str]:
             key = "/".join(parts).casefold()
             if key in selected:
                 raise ValueError(f"Duplicate update file: {info.filename}")
-            selected[key] = info
+            selected[key] = (parts, info)
 
         launcher_keys = [k for k in selected if k.endswith("fflauncher.exe")]
         if not launcher_keys:
             raise ValueError("Update archive is missing required binary: FFLauncher.exe.")
-        if selected[launcher_keys[0]].file_size < 1024 * 1024:
+        if selected[launcher_keys[0]][1].file_size < 1024 * 1024:
             raise ValueError("Update launcher executable is unexpectedly small.")
 
         written: list[str] = []
-        for key, info in selected.items():
-            parts = Path(info.filename.replace("\\", "/")).parts
-            if parts and parts[0].casefold() == "ff-slowseparation":
-                parts = parts[1:]
+        for _key, (parts, info) in selected.items():
             rel = Path(*parts)
-            target = stage_dir / rel
+            data = archive.read(info)
+            if existing_base is not None:
+                cur = _win_long_path(existing_base / rel)
+                try:
+                    if cur.is_file() and cur.stat().st_size == len(data) and cur.read_bytes() == data:
+                        continue
+                except OSError:
+                    pass
+            target = _win_long_path(stage_dir / rel)
             target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(info) as src, target.open("wb") as dst:
-                shutil.copyfileobj(src, dst)
+            target.write_bytes(data)
             written.append(rel.as_posix())
         return written
 
@@ -297,6 +389,7 @@ def build_update_relauncher_script(
     pid: int = 0,
     restart: bool = True,
     silent: bool = False,
+    tag: str = "",
 ) -> str:
     def ps_quote(value: object) -> str:
         return "'" + str(value).replace("'", "''") + "'"
@@ -304,94 +397,215 @@ def build_update_relauncher_script(
     game_path = ps_quote(Path(game_dir).resolve())
     stage_path = ps_quote(Path(stage_dir).resolve())
     title_text = ps_quote(title)
-    wait_pid_line = f"Wait-Process -Id {int(pid)} -Timeout 15 -ErrorAction SilentlyContinue" if pid and pid > 0 else ""
+    tag_text = ps_quote(tag or title)
+    wait_pid_line = f"Wait-Process -Id {int(pid)} -Timeout 20 -ErrorAction SilentlyContinue" if pid and pid > 0 else ""
     msg_err = (
         ""
         if silent
-        else "try { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show(('Update failed and changes were rolled back: ' + $_.Exception.Message), 'Update Failed') | Out-Null } catch {}\n"
-    )
-    msg_ok = (
-        ""
-        if silent
-        else "try { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show(($title + ' installed successfully. The launcher will restart.'), 'Update Complete') | Out-Null } catch {}\n"
+        else (
+            "try {\n"
+            "        Add-Type -AssemblyName System.Windows.Forms\n"
+            "        [System.Windows.Forms.MessageBox]::Show(\n"
+            "            ('Update failed and changes were rolled back:' + [Environment]::NewLine + $errMsg + [Environment]::NewLine + [Environment]::NewLine + 'See logs\\update.log for details.'),\n"
+            "            'FF SlowSeparation — Update Failed',\n"
+            "            [System.Windows.Forms.MessageBoxButtons]::OK,\n"
+            "            [System.Windows.Forms.MessageBoxIcon]::Error,\n"
+            "            [System.Windows.Forms.MessageBoxDefaultButton]::Button1,\n"
+            "            [System.Windows.Forms.MessageBoxOptions]::DefaultDesktopOnly\n"
+            "        ) | Out-Null\n"
+            "    } catch {}\n"
+        )
     )
     restart_block = (
-        "if (Test-Path -LiteralPath $targetLauncher -PathType Leaf) {\n"
-        "    Start-Process -FilePath $targetLauncher -WorkingDirectory $game\n"
-        "}\n"
+        "    if ([System.IO.File]::Exists($targetLauncherLP)) {\n"
+        "        Start-Process -FilePath $targetLauncher -WorkingDirectory $game\n"
+        "    }\n"
         if restart
         else ""
     )
-    return f"""
-$ErrorActionPreference = 'Stop'
+    return f"""$ErrorActionPreference = 'Stop'
+$tStart = Get-Date
 $game = {game_path}
 $stage = {stage_path}
 $title = {title_text}
+$tag = {tag_text}
+
+function ConvertTo-LongPath([string]$p) {{
+    $full = [System.IO.Path]::GetFullPath($p)
+    if ($full.StartsWith('\\\\?\\')) {{ return $full }}
+    if ($full.StartsWith('\\\\')) {{ return '\\\\?\\UNC\\' + $full.Substring(2) }}
+    return '\\\\?\\' + $full
+}}
+
+$gameLP = (ConvertTo-LongPath $game).TrimEnd('\\')
+$stageLP = (ConvertTo-LongPath $stage).TrimEnd('\\')
+$rollbackLP = $stageLP + '\\_rollback'
 $targetLauncher = Join-Path $game 'FFLauncher.exe'
-$targetLauncherFull = [IO.Path]::GetFullPath($targetLauncher)
-$logDir = Join-Path $game 'logs'
-$logFile = Join-Path $logDir 'update.log'
+$targetLauncherFull = [System.IO.Path]::GetFullPath($targetLauncher)
+$targetLauncherLP = ConvertTo-LongPath $targetLauncher
+$logDirLP = $gameLP + '\\logs'
+$logFileLP = $logDirLP + '\\update.log'
+$doneFileLP = $logDirLP + '\\update_done.json'
+$failFileLP = $logDirLP + '\\update_failed.json'
+$lockFileLP = $logDirLP + '\\.ff-update-active.pid'
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
 function Write-UpdateLog([string]$msg) {{
     try {{
-        if (-not (Test-Path -LiteralPath $logDir)) {{ New-Item -ItemType Directory -Force -Path $logDir | Out-Null }}
-        Add-Content -LiteralPath $logFile -Value ('[' + (Get-Date -Format 's') + '] ' + $msg) -ErrorAction SilentlyContinue
+        [System.IO.Directory]::CreateDirectory($logDirLP) | Out-Null
+        $line = '[' + (Get-Date -Format 's') + '] ' + $msg + [Environment]::NewLine
+        [System.IO.File]::AppendAllText($logFileLP, $line, $utf8NoBom)
     }} catch {{}}
 }}
-$rollback = Join-Path $stage '_rollback'
-New-Item -ItemType Directory -Force -Path $rollback | Out-Null
+
+function Remove-StageDir {{
+    for ($try = 1; $try -le 8; $try++) {{
+        try {{
+            if ([System.IO.Directory]::Exists($stageLP)) {{
+                [System.IO.Directory]::Delete($stageLP, $true)
+            }}
+            break
+        }} catch {{
+            Start-Sleep -Milliseconds 250
+        }}
+    }}
+}}
+
+Write-UpdateLog ('Updater started (PID ' + $PID + '): ' + $title)
+try {{
+    [System.IO.Directory]::CreateDirectory($logDirLP) | Out-Null
+    [System.IO.File]::WriteAllText($lockFileLP, [string]$PID, $utf8NoBom)
+}} catch {{}}
+
 $changed = [System.Collections.Generic.List[string]]::new()
 $appliedCount = 0
-Write-UpdateLog ('Applying update: ' + $title)
+$failed = $false
+$errMsg = ''
+
 try {{
+    [System.IO.Directory]::CreateDirectory($rollbackLP) | Out-Null
     {wait_pid_line}
-    $deadline = (Get-Date).AddSeconds(15)
+    $deadline = (Get-Date).AddSeconds(20)
     while ((Get-Date) -lt $deadline) {{
-        $alive = @(Get-CimInstance Win32_Process -Filter "Name='FFLauncher.exe'" -ErrorAction SilentlyContinue | Where-Object {{
-            $_.ExecutablePath -and [String]::Equals([IO.Path]::GetFullPath($_.ExecutablePath), $targetLauncherFull, [StringComparison]::OrdinalIgnoreCase)
-        }})
-        if ($alive.Count -eq 0) {{ break }}
-        Start-Sleep -Milliseconds 250
-    }}
-    Start-Sleep -Milliseconds 250
-    Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object {{
-        $name = $_.Name
-        if ($name.EndsWith('.tmp') -or $name.EndsWith('.update-new')) {{ return }}
-        if ($_.DirectoryName -eq $stage -and $name.EndsWith('.zip')) {{ return }}
-        $rel = $_.FullName.Substring($stage.Length).TrimStart('\\','/')
-        if ($rel.StartsWith('_rollback', [StringComparison]::OrdinalIgnoreCase)) {{ return }}
-        $source = $_.FullName
-        $target = Join-Path $game $rel
-        $backup = Join-Path $rollback $rel
-        $backupDir = Split-Path -Parent $backup
-        if (-not (Test-Path -LiteralPath $backupDir)) {{ New-Item -ItemType Directory -Force -Path $backupDir | Out-Null }}
-        $targetDir = Split-Path -Parent $target
-        if (-not (Test-Path -LiteralPath $targetDir)) {{ New-Item -ItemType Directory -Force -Path $targetDir | Out-Null }}
-        if (Test-Path -LiteralPath $target -PathType Leaf) {{ Copy-Item -LiteralPath $target -Destination $backup -Force }}
-        $changed.Add($rel)
-        $newFile = $target + '.update-new'
-        for ($attempt = 1; $attempt -le 10; $attempt++) {{
+        $stillRunning = $false
+        foreach ($proc in @([System.Diagnostics.Process]::GetProcessesByName('FFLauncher'))) {{
             try {{
-                Copy-Item -LiteralPath $source -Destination $newFile -Force
-                Move-Item -LiteralPath $newFile -Destination $target -Force
+                $pPath = $proc.MainModule.FileName
+                if ($pPath -and [String]::Equals([System.IO.Path]::GetFullPath($pPath), $targetLauncherFull, [StringComparison]::OrdinalIgnoreCase)) {{
+                    $stillRunning = $true
+                    break
+                }}
+            }} catch {{
+                try {{
+                    $cim = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $proc.Id) -ErrorAction SilentlyContinue
+                    if ($cim -and $cim.ExecutablePath -and [String]::Equals([System.IO.Path]::GetFullPath($cim.ExecutablePath), $targetLauncherFull, [StringComparison]::OrdinalIgnoreCase)) {{
+                        $stillRunning = $true
+                        break
+                    }}
+                }} catch {{}}
+            }} finally {{
+                try {{ $proc.Dispose() }} catch {{}}
+            }}
+        }}
+        if (-not $stillRunning) {{ break }}
+        Start-Sleep -Milliseconds 200
+    }}
+    Start-Sleep -Milliseconds 200
+
+    $prefixLen = $stageLP.Length + 1
+    foreach ($src in [System.IO.Directory]::EnumerateFiles($stageLP, '*', [System.IO.SearchOption]::AllDirectories)) {{
+        $rel = $src.Substring($prefixLen)
+        if ($rel.StartsWith('_rollback\\', [System.StringComparison]::OrdinalIgnoreCase)) {{ continue }}
+        $name = [System.IO.Path]::GetFileName($src)
+        if ($name.EndsWith('.tmp') -or $name.EndsWith('.update-new') -or $name.Contains('.update-old')) {{ continue }}
+        if (-not $rel.Contains('\\') -and $name.EndsWith('.zip', [System.StringComparison]::OrdinalIgnoreCase)) {{ continue }}
+
+        $dst = $gameLP + '\\' + $rel
+        $bak = $rollbackLP + '\\' + $rel
+        $dstDir = [System.IO.Path]::GetDirectoryName($dst)
+        $bakDir = [System.IO.Path]::GetDirectoryName($bak)
+        if ($bakDir) {{ [System.IO.Directory]::CreateDirectory($bakDir) | Out-Null }}
+        if ($dstDir) {{ [System.IO.Directory]::CreateDirectory($dstDir) | Out-Null }}
+
+        $newFile = $dst + '.update-new'
+        $backedUp = $false
+        $tracked = $false
+        for ($attempt = 1; $attempt -le 20; $attempt++) {{
+            $oldFile = $dst + '.update-old'
+            $movedOld = $false
+            try {{
+                if (-not $backedUp -and [System.IO.File]::Exists($dst)) {{
+                    [System.IO.File]::Copy($dst, $bak, $true)
+                    $backedUp = $true
+                }}
+                if (-not $tracked) {{
+                    $changed.Add($rel)
+                    $tracked = $true
+                }}
+                if ([System.IO.File]::Exists($newFile)) {{ [System.IO.File]::Delete($newFile) }}
+                [System.IO.File]::Copy($src, $newFile, $true)
+                if ([System.IO.File]::Exists($oldFile)) {{
+                    try {{ [System.IO.File]::Delete($oldFile) }} catch {{ $oldFile = $dst + '.update-old-' + $attempt }}
+                }}
+                if ([System.IO.File]::Exists($dst)) {{
+                    [System.IO.File]::Move($dst, $oldFile)
+                    $movedOld = $true
+                }}
+                [System.IO.File]::Move($newFile, $dst)
+                if ($movedOld -and [System.IO.File]::Exists($oldFile)) {{
+                    try {{ [System.IO.File]::Delete($oldFile) }} catch {{}}
+                }}
                 break
             }} catch {{
-                if ($attempt -ge 10) {{ throw }}
-                Start-Sleep -Milliseconds 300
+                if ($movedOld -and -not [System.IO.File]::Exists($dst) -and [System.IO.File]::Exists($oldFile)) {{
+                    try {{ [System.IO.File]::Move($oldFile, $dst) }} catch {{}}
+                }}
+                if ([System.IO.File]::Exists($newFile)) {{
+                    try {{ [System.IO.File]::Delete($newFile) }} catch {{}}
+                }}
+                if ($attempt -ge 20) {{ throw }}
+                Start-Sleep -Milliseconds 250
             }}
         }}
         $appliedCount++
     }}
-    Write-UpdateLog ('Applied ' + $appliedCount + ' files cleanly.')
-}} catch {{
-    Write-UpdateLog ('ERROR: ' + $_.Exception.Message + ' (rolling back ' + $changed.Count + ' files)')
+
+    $elapsed = [Math]::Round(((Get-Date) - $tStart).TotalSeconds, 2)
+    Write-UpdateLog ('Applied ' + $appliedCount + ' files cleanly in ' + $elapsed + 's.')
+    try {{ if ([System.IO.File]::Exists($failFileLP)) {{ [System.IO.File]::Delete($failFileLP) }} }} catch {{}}
+    try {{
+        $doneJson = (@{{ title = $title; tag = $tag; applied = $appliedCount; ts = (Get-Date -Format 's') }} | ConvertTo-Json -Compress)
+        [System.IO.File]::WriteAllText($doneFileLP, $doneJson, $utf8NoBom)
+    }} catch {{}}
+    Remove-StageDir
+{restart_block}}} catch {{
+    $failed = $true
+    $errMsg = $_.Exception.Message
+    Write-UpdateLog ('ERROR: ' + $errMsg + ' (rolling back ' + $changed.Count + ' files)')
     for ($i = $changed.Count - 1; $i -ge 0; $i--) {{
-        $rel = $changed[$i]; $target = Join-Path $game $rel; $backup = Join-Path $rollback $rel
-        if (Test-Path -LiteralPath $backup -PathType Leaf) {{ Copy-Item -LiteralPath $backup -Destination $target -Force -ErrorAction SilentlyContinue }}
-        else {{ Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }}
+        $rel = $changed[$i]
+        $dst = $gameLP + '\\' + $rel
+        $bak = $rollbackLP + '\\' + $rel
+        try {{
+            if ([System.IO.File]::Exists($bak)) {{ [System.IO.File]::Copy($bak, $dst, $true) }}
+            elseif ([System.IO.File]::Exists($dst)) {{ [System.IO.File]::Delete($dst) }}
+        }} catch {{}}
+        foreach ($suf in @('.update-new', '.update-old')) {{
+            try {{ if ([System.IO.File]::Exists($dst + $suf)) {{ [System.IO.File]::Delete($dst + $suf) }} }} catch {{}}
+        }}
     }}
-    {msg_err}exit 1
+    try {{
+        $failJson = (@{{ title = $title; tag = $tag; error = $errMsg; ts = (Get-Date -Format 's') }} | ConvertTo-Json -Compress)
+        [System.IO.File]::WriteAllText($failFileLP, $failJson, $utf8NoBom)
+    }} catch {{}}
+    Remove-StageDir
+    {msg_err}}} finally {{
+    try {{ if ([System.IO.File]::Exists($lockFileLP)) {{ [System.IO.File]::Delete($lockFileLP) }} }} catch {{}}
+    if ($PSCommandPath -and [System.IO.File]::Exists($PSCommandPath)) {{
+        try {{ [System.IO.File]::Delete($PSCommandPath) }} catch {{}}
+    }}
 }}
-{msg_ok}{restart_block}Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+if ($failed) {{ exit 1 }}
 """
 
 
@@ -675,12 +889,17 @@ class FFLauncherApp(tk.Tk):
         self._load_ini_into_vars()
         self._refresh_status_cards()
         self.select_tab(initial_tab)
+        self._recent_update_done = self._consume_update_done_marker()
+        if self._recent_update_done:
+            done_title = self._recent_update_done.get("title") or self.version
+            self.update_status.config(text=f"Updated to {done_title} cleanly.", fg=C_OK)
 
         threading.Thread(target=self._probe_gpu_async, daemon=True).start()
         if self.shot_path:
             self.after(450, self._capture_shot_and_exit)
         else:
             self.after(250, self._auto_refresh_existing_build)
+            self.after(1500, lambda: threading.Thread(target=cleanup_stale_update_dirs, args=(self.root_dir,), daemon=True).start())
             if not getattr(self, "_skip_update_check", False):
                 self.after(700, self.check_for_updates)
 
@@ -1992,6 +2211,51 @@ class FFLauncherApp(tk.Tk):
             else:
                 self.after(0, lambda: self._show_release_error("Update check failed: " + detail))
 
+    def _update_done_marker_path(self) -> Path:
+        return self._logs_dir() / "update_done.json"
+
+    def _update_failed_marker_path(self) -> Path:
+        return self._logs_dir() / "update_failed.json"
+
+    def _consume_update_done_marker(self) -> dict | None:
+        p = self._update_done_marker_path()
+        if not p.is_file():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8-sig", errors="ignore"))
+        except Exception:
+            data = None
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return data if isinstance(data, dict) else None
+
+    def _read_update_failed_marker(self) -> dict | None:
+        p = self._update_failed_marker_path()
+        if not p.is_file():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8-sig", errors="ignore"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _clear_update_failed_marker(self) -> None:
+        try:
+            self._update_failed_marker_path().unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _write_update_failed_marker(self, tag: str, title: str, error: str) -> None:
+        try:
+            p = self._update_failed_marker_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"tag": tag, "title": title, "error": error, "ts": datetime.now().isoformat(timespec="seconds")}
+            p.write_text(json.dumps(payload), encoding="utf-8")
+        except OSError:
+            pass
+
     def _show_release_error(self, message: str) -> None:
         self.release_check_active = False
         self.update_status.config(text=message, fg=C_BAD)
@@ -2013,7 +2277,13 @@ class FFLauncherApp(tk.Tk):
             or is_same_version(self.version, clean_title)
             or (not version_tuple(tag)[0] and is_up_to_date(self.version, clean_title))
         ):
-            self.update_status.config(text=f"Your FF SlowSeparation is up to date ({self.version})", fg=C_OK)
+            self._clear_update_failed_marker()
+            if getattr(self, "_recent_update_done", None):
+                self.update_status.config(
+                    text=f"Updated cleanly — FF SlowSeparation is up to date ({self.version})", fg=C_OK
+                )
+            else:
+                self.update_status.config(text=f"Your FF SlowSeparation is up to date ({self.version})", fg=C_OK)
             self.update_action_btn.pack_forget()
             self.release_btn.pack_forget()
             return
@@ -2023,13 +2293,31 @@ class FFLauncherApp(tk.Tk):
             self.release_btn.config(text="VIEW RELEASE NOTES")
             self.release_btn.pack(side=tk.LEFT, padx=(10, 0))
             return
-        self.update_status.config(text=f"Update available: {clean_title} — installing…", fg=C_WARN)
-        self.update_action_btn.config(state=tk.DISABLED, text="AUTO-INSTALLING…")
-        self.update_action_btn.pack(side=tk.LEFT, padx=(10, 0))
-        self.release_btn.config(text="VIEW RELEASE NOTES")
-        self.release_btn.pack(side=tk.LEFT, padx=(10, 0))
+        failed = self._read_update_failed_marker()
+        if failed and (failed.get("tag") or "").casefold() == tag.casefold():
+            err_preview = str(failed.get("error") or "see logs\\update.log").splitlines()[0][:120]
+            self.update_status.config(
+                text=f"Previous auto-update to {clean_title} failed ({err_preview}) — click INSTALL UPDATE to retry.",
+                fg=C_BAD,
+            )
+            self.update_action_btn.config(state=tk.NORMAL, text="INSTALL UPDATE")
+            self.update_action_btn.pack(side=tk.LEFT, padx=(10, 0))
+            self.release_btn.config(text="VIEW RELEASE NOTES")
+            self.release_btn.pack(side=tk.LEFT, padx=(10, 0))
+            return
         if self.auto_install_updates:
+            self.update_status.config(text=f"Update available: {clean_title} — installing…", fg=C_WARN)
+            self.update_action_btn.config(state=tk.DISABLED, text="AUTO-INSTALLING…")
+            self.update_action_btn.pack(side=tk.LEFT, padx=(10, 0))
+            self.release_btn.config(text="VIEW RELEASE NOTES")
+            self.release_btn.pack(side=tk.LEFT, padx=(10, 0))
             self.after(400, lambda: self.apply_latest_update(auto=True))
+        else:
+            self.update_status.config(text=f"Update available: {clean_title}", fg=C_WARN)
+            self.update_action_btn.config(state=tk.NORMAL, text="INSTALL UPDATE")
+            self.update_action_btn.pack(side=tk.LEFT, padx=(10, 0))
+            self.release_btn.config(text="VIEW RELEASE NOTES")
+            self.release_btn.pack(side=tk.LEFT, padx=(10, 0))
 
     def open_latest_release(self) -> None:
         url = self.latest_release["page"] if (self.latest_release and self.latest_release.get("page")) else RELEASES_URL
@@ -2045,7 +2333,10 @@ class FFLauncherApp(tk.Tk):
             return
         warning = game_process_warning(self.root_dir, "applying a launcher/game update")
         if warning:
-            messagebox.showwarning("Close the Game First", warning, parent=self)
+            self.update_action_btn.config(state=tk.NORMAL, text="INSTALL UPDATE")
+            self.update_status.config(text="Close Fast Fusion (ff.exe) before installing the update.", fg=C_WARN)
+            if not auto:
+                messagebox.showwarning("Close the Game First", warning, parent=self)
             return
         title = self.latest_release.get("title", "FF SlowSeparation Update")
         if not auto and not messagebox.askyesno(
@@ -2058,6 +2349,8 @@ class FFLauncherApp(tk.Tk):
         if not self.latest_release.get("asset_url") or not self.latest_release.get("asset_name"):
             self.update_status.config(text="Update.zip download URL is missing.", fg=C_BAD)
             return
+        if not auto:
+            self._clear_update_failed_marker()
         self.update_in_progress = True
         self._auto_installing = bool(auto)
         self.update_action_btn.config(state=tk.DISABLED, text="DOWNLOADING UPDATE…")
@@ -2087,18 +2380,33 @@ class FFLauncherApp(tk.Tk):
                     if total:
                         percent = min(100, downloaded * 100 // total)
                         self._set_update_status(f"Downloading update… {percent}%", C_TEXT_DIM)
-            self._set_update_status("Validating update archive…", C_TEXT_DIM)
-            files = extract_update_archive(archive_path, stage)
+            self._set_update_status("Validating & staging update files…", C_TEXT_DIM)
+            files = extract_update_archive(archive_path, stage, existing_root=target)
             archive_path.unlink(missing_ok=True)
-            lower = {f.casefold() for f in files}
-            if "fflauncher.exe" not in lower:
-                raise ValueError("The validated update archive is missing FFLauncher.exe.")
+            if not files:
+                shutil.rmtree(_win_long_path(stage), ignore_errors=True)
+                self.after(0, lambda: self._update_already_applied(release))
+                return
             self.after(0, lambda: self._update_ready(release, stage, files))
         except Exception as exc:
             if stage:
-                shutil.rmtree(stage, ignore_errors=True)
+                shutil.rmtree(_win_long_path(stage), ignore_errors=True)
             detail = str(exc)
+            if getattr(self, "_auto_installing", False):
+                self._write_update_failed_marker(
+                    release.get("tag", ""),
+                    release.get("title", "FF SlowSeparation Update"),
+                    detail,
+                )
             self.after(0, lambda: self._update_failed(detail))
+
+    def _update_already_applied(self, release: dict) -> None:
+        self.update_in_progress = False
+        self._clear_update_failed_marker()
+        self.version = read_app_version()
+        self.update_status.config(text=f"Your FF SlowSeparation is up to date ({self.version})", fg=C_OK)
+        self.update_action_btn.pack_forget()
+        self.release_btn.pack_forget()
 
     def _set_update_status(self, text: str, color: str) -> None:
         try:
@@ -2113,45 +2421,73 @@ class FFLauncherApp(tk.Tk):
 
     def _update_ready(self, release: dict, stage: Path, files: list[str]) -> None:
         title = release.get("title", "FF SlowSeparation Update")
+        tag = release.get("tag", "")
         auto = getattr(self, "_auto_installing", False)
         if not auto and not messagebox.askyesno(
             "Update Ready",
-            f"{title} is downloaded and verified.\n\nInstall it now? The launcher will close, apply the files, and restart automatically.",
+            f"{title} is downloaded and verified ({len(files)} updated file(s)).\n\n"
+            "Install it now? The launcher will close, apply the files, and restart automatically.",
             parent=self,
         ):
-            shutil.rmtree(stage, ignore_errors=True)
+            shutil.rmtree(_win_long_path(stage), ignore_errors=True)
             self.update_in_progress = False
             self.update_action_btn.config(state=tk.NORMAL, text="INSTALL UPDATE")
             self.update_status.config(text="Update downloaded; installation cancelled.", fg=C_TEXT_DIM)
             return
         try:
-            self._start_update_relauncher(stage, title)
+            self.update_status.config(text=f"Applying {title}… restarting launcher.", fg=C_WARN)
+            self.update_idletasks()
+            self.withdraw()
+            self._start_update_relauncher(stage, title, tag=tag)
             os._exit(0)
         except Exception as exc:
-            shutil.rmtree(stage, ignore_errors=True)
+            try:
+                self.deiconify()
+            except Exception:
+                pass
+            shutil.rmtree(_win_long_path(stage), ignore_errors=True)
+            if auto:
+                self._write_update_failed_marker(tag, title, str(exc))
             self._update_failed(str(exc))
 
-    def _start_update_relauncher(self, stage: Path, title: str) -> None:
-        script = build_update_relauncher_script(self.root_dir, stage, title, pid=os.getpid(), restart=True, silent=False)
-        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-        flags = getattr(subprocess, "DETACHED_PROCESS", 0)
-        subprocess.Popen(
+    def _start_update_relauncher(self, stage: Path, title: str, tag: str = "") -> None:
+        script = build_update_relauncher_script(
+            self.root_dir, stage, title, pid=os.getpid(), restart=True, silent=False, tag=tag
+        )
+        temp_dir = Path(tempfile.gettempdir())
+        script_path = temp_dir / f"ff-update-{stage.name}.ps1"
+        # UTF-8 with BOM ensures Windows PowerShell 5.1 parses non-ASCII/accented paths reliably.
+        script_path.write_text(script, encoding="utf-8-sig")
+        # IMPORTANT: Do NOT use DETACHED_PROCESS with powershell.exe — Windows PowerShell 5.1
+        # silently exits with code 0 without running the script when no console is attached.
+        # CREATE_NO_WINDOW allocates a hidden console so the script runs reliably with no popup window.
+        flags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        proc = subprocess.Popen(
             [
                 "powershell.exe",
                 "-NoProfile",
+                "-NonInteractive",
                 "-ExecutionPolicy",
                 "Bypass",
                 "-WindowStyle",
                 "Hidden",
-                "-EncodedCommand",
-                encoded,
+                "-File",
+                str(script_path),
             ],
-            cwd=str(self.root_dir),
+            cwd=str(temp_dir),
             creationflags=flags,
+            close_fds=True,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        time.sleep(0.05)
+        rc = proc.poll()
+        if rc is not None and rc != 0:
+            raise RuntimeError(f"Updater helper exited immediately with code {rc}.")
 
     def _capture_shot_and_exit(self) -> None:
         try:

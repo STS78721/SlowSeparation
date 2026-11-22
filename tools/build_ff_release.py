@@ -69,7 +69,7 @@ def read_version() -> str:
     if p.is_file():
         # utf-8-sig drops a PowerShell/Notepad BOM that would poison package filenames.
         return p.read_text(encoding="utf-8-sig").strip().splitlines()[0].strip()
-    return "Alpha 0.1.2"
+    return "Alpha 0.1.2a"
 
 
 def version_slug(ver: str) -> str:
@@ -153,6 +153,7 @@ def stage_python(stage: Path) -> Path:
     r = subprocess.run(
         [
             str(py_dst / "python.exe"),
+            "-B",
             "-I",
             "-c",
             "from compression import zstd; import numpy, lz4.block; "
