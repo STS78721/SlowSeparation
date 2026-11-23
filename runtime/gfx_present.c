@@ -26,6 +26,13 @@
 #include "ui/menu.h"
 #include "vk.h"
 #include "platform/platform.h"
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <vulkan/vulkan_win32.h>
+#endif
 
 #define FRAMES 2
 #define MAX_IMAGES 16
@@ -421,16 +428,18 @@ static void fg_apply_locked(void) {
     }
     const char *eff_mode = !strcmp(mode, "dlss_fg") ? "msm_fg" : mode;
     int mult = !strcmp(mult_s, "6x") ? 6 : !strcmp(mult_s, "4x") ? 4 : !strcmp(mult_s, "3x") ? 3 : 2;
-    __atomic_store_n(&g_fg_mult, mult, __ATOMIC_RELAXED);
+    // Frame interpolation compute pass is not wired into the present loop yet; keep multiplier at 1x
+    // and report truthfully instead of claiming active generated frames.
+    __atomic_store_n(&g_fg_mult, 1, __ATOMIC_RELAXED);
     char sig[160];
     snprintf(sig, sizeof sig, "%s|%d", eff_mode, mult);
     if (strcmp(sig, g_fg_logged)) {
         snprintf(g_fg_logged, sizeof g_fg_logged, "%s", sig);
         const char *mname = !strcmp(eff_mode, "xefg") ? "Intel XeSS Frame Generation"
                           : !strcmp(eff_mode, "fsr3_fg") ? "AMD FidelityFX FSR 3.1 Frame Generation"
-                          : "Nodix Super Motion (SMFG 1.3 Compute)";
-        vk_upscaler_log("SUPER MOTION: ENGAGED -> %s | Multiplier=%dx (%d generated frame(s) per render) | GPU='%s'",
-                        mname, mult, mult - 1, c->props.deviceName);
+                          : "Nodix Super Motion (SMFG)";
+        vk_upscaler_log("SUPER MOTION: %s (%dx) selected, but frame interpolation is not implemented yet; presenting native frames",
+                        mname, mult);
     }
 }
 
@@ -539,6 +548,19 @@ static int create_swapchain(void) {
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = pick_present_mode(c->phys), .clipped = VK_TRUE,
         .oldSwapchain = old};
+#ifdef _WIN32
+    // Keep borderless DWM Independent Flip and forbid implicit Vulkan exclusive-fullscreen takeover,
+    // which otherwise drops Windows HDR / corrupts HDR tone mapping on HDR monitors and OLED TVs.
+    VkSurfaceFullScreenExclusiveInfoEXT fse = {
+        .sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT,
+        .fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT,
+    };
+    if (c->has_full_screen_exclusive) {
+        ci.pNext = &fse;
+        static int logged_fse = 0;
+        if (!logged_fse++) rt_log("gfx: borderless flip locked (VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT, preserves Windows HDR)");
+    }
+#endif
     VkResult r = vkCreateSwapchainKHR(c->device, &ci, NULL, &g_sc);
     if (r != VK_SUCCESS) {
         rt_log("gfx: vkCreateSwapchainKHR failed (%d)", (int)r);

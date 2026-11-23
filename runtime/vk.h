@@ -39,6 +39,8 @@ typedef struct VkCtx {
         debug_utils,                       // VK_EXT_debug_utils enabled on the instance (validation or the checkpoints)
         has_nv_reflex,
         has_amd_antilag,
+        has_get_surface_caps2,              // VK_KHR_get_surface_capabilities2 on instance (Win32 FSE control)
+        has_full_screen_exclusive,          // VK_EXT_full_screen_exclusive on device (disallows FSE hijack / preserves HDR)
         gpu_is_nvidia,
         gpu_is_rtx40_plus,
         gpu_is_rtx50,

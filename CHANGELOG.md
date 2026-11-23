@@ -5,6 +5,23 @@ below come from the shared Universal NS2 to PC history this project is built on.
 
 ---
 
+## [Alpha 0.1.2c] - 2026-11-23
+
+### 🛠️ Menu Ship Zoom, Auto-Relink, Windows HDR & Clean Defaults Hotfix
+- **Fixed 2× zoomed-in ships in Vehicle Selection & Fusion Shop (`runtime/resolution.c`, `runtime/nvn_api_nvn2.c`):**
+  - The 3D ship preview framebuffers (`vehicleCb`/`vehicleDb` at `1920x1080` and Fusion Shop `cb`/`db` at `1776x999`) are composited onto the menu's fixed `1920x1080` ortho canvas using their texture dimensions. Leaving these ortho-preview buffers and derived pass targets at their native sizes keeps ships framed 1:1 in both Vehicle Selection and Fusion Shop while keeping the menu UI and 3D races at crisp native 1440p / 4K (and saving ~500 MiB of render-target pool memory).
+- **Bulletproof `FFLauncher` runtime auto-relink after updates (`launcher/FFLauncher.py`, `tools/build_ff_release.py`, `runtime/game_profile.c`):**
+  - Previously, clicking `PLAY` quickly, manually extracting `Update.zip` (which backdated files to `2026-01-01`), having `exefs` outside the root folder, or hitting a silent refresh error could leave players running their old `ff.exe` binary even after updating the launcher.
+  - `FFLauncher` now detects stale `ff.exe` synchronously (tracking `libffrt.a`, `build_game.py`, and `ff.exe` size), gates `PLAY` so stale builds automatically relink before launching, unlinks cached `work/build/ff100/ff.exe` before Ninja runs, resolves external `exefs` paths from `modules.c`, isolates bundled Python from host `PYTHONHOME`/`PYTHONPATH`, verifies copied `ff.exe` via SHA-256, and writes detailed logs to `logs/refresh.log`.
+  - Release zips now carry current UTC timestamps and zero extra `.pyc` files, and `ff.exe` logs its built version (`port=Alpha 0.1.2c`) on startup.
+- **Preserved Windows HDR on HDR monitors & OLED TVs (`runtime/vk.h`, `runtime/vk_device.c`, `runtime/gfx_present.c`, `runtime/gfx_window_win.c`):**
+  - Enables `VK_KHR_get_surface_capabilities2` + `VK_EXT_full_screen_exclusive` with `VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT` on Windows swapchains so Vulkan stays in borderless DWM Independent Flip and never hijacks the display into exclusive SDR fullscreen or disrupts Windows HDR settings.
+  - Opens fullscreen sessions directly as a borderless `WS_POPUP` window covering the monitor, eliminating the initial bordered-to-fullscreen swapchain flicker.
+- **Honest Frame Generation defaults & status (`runtime/cfg.c`, `runtime/gfx_present.c`, `runtime/ui/menu.cpp`, `launcher/FFLauncher.py`):**
+  - Set zero-config defaults for `FRAME_GEN` to `0` and `FG_MODE` to `off`, and updated logs and menus to note that frame interpolation is not active yet rather than reporting active generated frames.
+
+---
+
 ## [Alpha 0.1.2b] - 2026-11-23
 
 ### 🛠️ End-of-Race Rapid-Confirm Crash Fix

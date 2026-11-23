@@ -11,6 +11,13 @@
 #include "host.h"
 #include "vk.h"
 #include "platform/platform.h"
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <vulkan/vulkan_win32.h>
+#endif
 
 static VkCtx g_vk;
 static int g_ready;
@@ -68,17 +75,21 @@ static int create_instance(void) {
     // The checkpoints also want debug utils, for the device address binding messenger (vk_crumbs.c).
     int utils = validate;
     const char *ck = cfg_get("TOTK_GPU_CHECKPOINTS");
-    if (!utils && ck && !strcmp(ck, "1")) {
-        uint32_t ni = 0;
-        vkEnumerateInstanceExtensionProperties(NULL, &ni, NULL);
-        VkExtensionProperties *ip = calloc(ni ? ni : 1, sizeof *ip);
-        if (ip) {
-            vkEnumerateInstanceExtensionProperties(NULL, &ni, ip);
-            utils = has_ext(ip, ni, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-            free(ip);
-        } else utils = 0;
+    uint32_t ni = 0;
+    vkEnumerateInstanceExtensionProperties(NULL, &ni, NULL);
+    VkExtensionProperties *ip = calloc(ni ? ni : 1, sizeof *ip);
+    if (ip) vkEnumerateInstanceExtensionProperties(NULL, &ni, ip);
+    if (!utils && ck && !strcmp(ck, "1") && ip) {
+        utils = has_ext(ip, ni, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
     if (utils) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+#ifdef _WIN32
+    if (ip && has_ext(ip, ni, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+        g_vk.has_get_surface_caps2 = 1;
+        ext[n_ext++] = VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME;
+    }
+#endif
+    free(ip);
     g_vk.debug_utils = utils;
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "TotK Recomp",
                              .pEngineName = "TotK Recomp", .apiVersion = VK_API_VERSION_1_3};
@@ -301,6 +312,12 @@ static int create_device(void) {
         g_vk.has_amd_antilag = 1;
         ext[n_ext++] = "VK_AMD_anti_lag";
     }
+#ifdef _WIN32
+    if (g_vk.has_get_surface_caps2 && has_ext(ep, ne, VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME)) {
+        g_vk.has_full_screen_exclusive = 1;
+        ext[n_ext++] = VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME;
+    }
+#endif
     // NVIDIA's counterpart, opt-in because every pipeline bind then carries a checkpoint command.
     {
         const char *e = cfg_get("TOTK_GPU_CHECKPOINTS");

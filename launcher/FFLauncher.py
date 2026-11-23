@@ -43,7 +43,7 @@ from ff_dump import (
 
 APP_TITLE = "FF SlowSeparation"
 APP_SUBTITLE = "Fast Fusion  ·  Native Windows PC Recompilation"
-DEFAULT_VERSION = "Alpha 0.1.2b"
+DEFAULT_VERSION = "Alpha 0.1.2c"
 GITHUB_URL = "https://github.com/STS78721/SlowSeparation"
 RELEASES_URL = GITHUB_URL + "/releases"
 RELEASES_API_URL = "https://api.github.com/repos/STS78721/SlowSeparation/releases/latest"
@@ -877,6 +877,9 @@ class FFLauncherApp(tk.Tk):
         self.setup_status_var = tk.StringVar(value="Select your Fast Fusion 1.0.0 ExeFS & RomFS folders to build ff.exe locally.")
         self.setup_running = False
         self.refresh_running = False
+        self._last_refresh_error: str | None = None
+        self._launch_after_refresh = False
+        self._runtime_stamp_cache: tuple[tuple, str] | None = None
         self._last_nup_extract: tuple[Path, Path, Path] | None = None
         self.current_tab = initial_tab
         self.latest_release: dict | None = None
@@ -898,7 +901,7 @@ class FFLauncherApp(tk.Tk):
         if self.shot_path:
             self.after(450, self._capture_shot_and_exit)
         else:
-            self.after(250, self._auto_refresh_existing_build)
+            self.after(50, self._auto_refresh_existing_build)
             self.after(1500, lambda: threading.Thread(target=cleanup_stale_update_dirs, args=(self.root_dir,), daemon=True).start())
             if not getattr(self, "_skip_update_check", False):
                 self.after(700, self.check_for_updates)
@@ -1556,16 +1559,51 @@ class FFLauncherApp(tk.Tk):
         ready = exe.is_file()
         ini_exists = self._ini_path().is_file()
 
-        if ready:
-            self.build_state_lbl.configure(text="Ready to Race  (ff.exe found)", fg=C_OK)
-            self.build_hint_lbl.configure(text=f"Executable: {exe}. Press PLAY below to launch Fast Fusion natively.")
-            self.play_btn.configure(state=tk.NORMAL)
+        if self.refresh_running:
+            self.build_state_lbl.configure(text=f"Updating ff.exe for {self.version}…", fg=C_WARN)
+            self.build_hint_lbl.configure(
+                text="Relinking ff.exe with the updated runtime (usually 10–20 seconds). PLAY will unlock automatically.",
+                fg=C_TEXT_SOFT,
+            )
+            self.play_btn.configure(text="UPDATING ff.exe…", state=tk.DISABLED)
+        elif ready:
+            stale, reason, refresh_args = self._stale_build_status()
+            if self._last_refresh_error:
+                first_line = self._last_refresh_error.splitlines()[0][:140]
+                self.build_state_lbl.configure(text=f"ff.exe Update Failed ({self.version})", fg=C_BAD)
+                self.build_hint_lbl.configure(
+                    text=f"{first_line} — See logs\\refresh.log, or click RETRY UPDATE & PLAY.",
+                    fg=C_BAD,
+                )
+                self.play_btn.configure(text="RETRY UPDATE & PLAY", state=tk.NORMAL)
+            elif stale and refresh_args is not None:
+                self.build_state_lbl.configure(text=f"Update Required  (relinking ff.exe for {self.version})", fg=C_WARN)
+                self.build_hint_lbl.configure(
+                    text=f"Installed ff.exe is from an older runtime. Click UPDATE & PLAY (or wait a moment) to apply {self.version}.",
+                    fg=C_WARN,
+                )
+                self.play_btn.configure(text="UPDATE & PLAY", state=tk.NORMAL)
+            elif stale:
+                self.build_state_lbl.configure(text=f"Outdated ff.exe  (rebuild needed for {self.version})", fg=C_WARN)
+                self.build_hint_lbl.configure(
+                    text=f"Installed ff.exe does not match {self.version} ({reason}). Open SETUP FROM DUMP to rebuild ff.exe.",
+                    fg=C_WARN,
+                )
+                self.play_btn.configure(text="PLAY (OUTDATED ff.exe)", state=tk.NORMAL)
+            else:
+                self.build_state_lbl.configure(text=f"Ready to Race  (ff.exe · {self.version})", fg=C_OK)
+                self.build_hint_lbl.configure(
+                    text=f"Executable: {exe}. Press PLAY below to launch Fast Fusion natively.",
+                    fg=C_TEXT_SOFT,
+                )
+                self.play_btn.configure(text="PLAY FAST FUSION", state=tk.NORMAL)
         else:
             self.build_state_lbl.configure(text="Setup Required  (no game files included)", fg=C_WARN)
             self.build_hint_lbl.configure(
-                text="Open SETUP FROM DUMP to point FF SlowSeparation at your dumped Fast Fusion 1.0.0 ExeFS & RomFS folders."
+                text="Open SETUP FROM DUMP to point FF SlowSeparation at your dumped Fast Fusion 1.0.0 ExeFS & RomFS folders.",
+                fg=C_TEXT_SOFT,
             )
-            self.play_btn.configure(state=tk.DISABLED)
+            self.play_btn.configure(text="PLAY FAST FUSION", state=tk.DISABLED)
 
         if ini_exists:
             self.profile_badge.configure(text="CUSTOM ff.ini ACTIVE")
@@ -1576,7 +1614,8 @@ class FFLauncherApp(tk.Tk):
 
         self.res_summary_label.configure(text=self.vars["resolution"].get())
         self.upscaler_summary_label.configure(text=f"{self.vars['output_res'].get()} · {self.vars['upscaler'].get().upper()}")
-        self.fg_summary_label.configure(text=self.vars["fg_mode"].get())
+        fg_val = self.vars["fg_mode"].get()
+        self.fg_summary_label.configure(text="off" if fg_val == "off" else f"{fg_val} (not active yet)")
 
     def _reload_settings_ui(self) -> None:
         self._load_ini_into_vars()
@@ -1620,6 +1659,27 @@ class FFLauncherApp(tk.Tk):
         if not exe.is_file():
             self.select_tab("setup")
             return
+        if self.refresh_running:
+            messagebox.showinfo(
+                APP_TITLE,
+                f"Updating ff.exe for {self.version} is still in progress.\nPlease wait a moment until it finishes.",
+                parent=self,
+            )
+            return
+        stale, reason, refresh_args = self._stale_build_status()
+        if stale:
+            if refresh_args is not None:
+                self._auto_refresh_existing_build(launch_after=True)
+                return
+            if messagebox.askyesno(
+                f"{APP_TITLE} — Outdated ff.exe",
+                f"Your ff.exe was built with an older runtime than {self.version} ({reason}), "
+                "so the latest fixes are not inside ff.exe yet.\n\n"
+                "Open SETUP FROM DUMP to rebuild ff.exe now? (Click No to launch the older ff.exe anyway.)",
+                parent=self,
+            ):
+                self.select_tab("setup")
+                return
         try:
             subprocess.Popen([str(exe)], cwd=str(self.root_dir))
         except OSError as exc:
@@ -1817,10 +1877,7 @@ class FFLauncherApp(tk.Tk):
                 )
 
             py = self._find_setup_python()
-            env = dict(os.environ)
-            for d in (self.root_dir / "python", self.root_dir / "llvm" / "bin", self.root_dir / "bin"):
-                if d.is_dir():
-                    env["PATH"] = str(d) + os.pathsep + env.get("PATH", "")
+            env = self._clean_tool_env()
 
             # Step 2: RomFS pack or use already packed folder
             packed_romfs = self.root_dir / "romfs_packed"
@@ -1990,14 +2047,56 @@ class FFLauncherApp(tk.Tk):
         self.after(0, lambda: self._log_setup("Shader pre-warm complete: shader cache and pipeline libraries are ready."))
         return True
 
+    def _clean_tool_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        # Isolate bundled python.exe from any host Python/PyInstaller environment variables.
+        for k in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE", "VIRTUAL_ENV"):
+            env.pop(k, None)
+        for d in (self.root_dir / "python", self.root_dir / "llvm" / "bin", self.root_dir / "bin"):
+            if d.is_dir():
+                env["PATH"] = str(d) + os.pathsep + env.get("PATH", "")
+        return env
+
     def _runtime_stamp(self) -> str:
         rt_lib = self.root_dir / "runtime" / "libffrt.a"
         if not rt_lib.is_file():
             return ""
-        lib_hash = hashlib.sha256(rt_lib.read_bytes()).hexdigest()[:16]
+        bg = self.root_dir / "tools" / "build_game.py"
         xlate_id = self.root_dir / "bin" / "ns2_xlate.id"
+        st_lib = rt_lib.stat()
+        st_bg = bg.stat() if bg.is_file() else None
+        st_xl = xlate_id.stat() if xlate_id.is_file() else None
+        key = (
+            self.version,
+            st_lib.st_size,
+            st_lib.st_mtime_ns,
+            st_bg.st_size if st_bg else 0,
+            st_bg.st_mtime_ns if st_bg else 0,
+            st_xl.st_size if st_xl else 0,
+            st_xl.st_mtime_ns if st_xl else 0,
+        )
+        if self._runtime_stamp_cache and self._runtime_stamp_cache[0] == key:
+            return self._runtime_stamp_cache[1]
+        lib_hash = hashlib.sha256(rt_lib.read_bytes()).hexdigest()[:16]
+        bg_hash = hashlib.sha256(bg.read_bytes()).hexdigest()[:12] if bg.is_file() else ""
         xlate_txt = xlate_id.read_text(encoding="utf-8", errors="ignore").strip() if xlate_id.is_file() else ""
-        return f"{self.version}|{rt_lib.stat().st_size}|{lib_hash}|{xlate_txt}"
+        stamp = f"{self.version}|{st_lib.st_size}|{lib_hash}|{bg_hash}|{xlate_txt}"
+        self._runtime_stamp_cache = (key, stamp)
+        return stamp
+
+    def _resolve_exefs(self) -> Path | None:
+        direct = self.root_dir / "exefs"
+        if (direct / "main").is_file():
+            return direct
+        mods_c = self.root_dir / "work" / "build" / "ff100" / "modules.c"
+        if mods_c.is_file():
+            txt = mods_c.read_text(encoding="utf-8", errors="ignore")
+            m = re.search(r'rt_default_exefs\[\]\s*=\s*"([^"]+)"', txt)
+            if m:
+                cand = Path(m.group(1).replace("\\\\", "\\"))
+                if (cand / "main").is_file():
+                    return cand
+        return direct if direct.is_dir() else None
 
     def _resolve_packed_romfs(self) -> Path | None:
         direct = self.root_dir / "romfs_packed"
@@ -2016,13 +2115,71 @@ class FFLauncherApp(tk.Tk):
     def _runtime_stamp_path(self) -> Path:
         return self.root_dir / "work" / "build" / "ff100" / ".ff_runtime_stamp"
 
-    def _write_runtime_stamp(self) -> None:
+    def _write_runtime_stamp(self, exe_size: int | None = None) -> None:
         stamp = self._runtime_stamp()
         if not stamp:
             return
+        if exe_size is None:
+            exe = self._exe_path()
+            exe_size = exe.stat().st_size if exe.is_file() else 0
         sp = self._runtime_stamp_path()
         sp.parent.mkdir(parents=True, exist_ok=True)
-        sp.write_text(stamp + "\n", encoding="utf-8")
+        sp.write_text(f"{stamp}|exe:{exe_size}\n", encoding="utf-8")
+
+    def _parse_stored_stamp(self, raw: str) -> tuple[str, int | None]:
+        text = (raw or "").strip()
+        if not text:
+            return "", None
+        m = re.search(r"\|exe:(\d+)$", text)
+        if m:
+            return text[: m.start()], int(m.group(1))
+        return text, None
+
+    def _stale_build_status(self) -> tuple[bool, str, tuple[Path, Path, Path, str, str] | None]:
+        exe = self._exe_path()
+        rt_lib = self.root_dir / "runtime" / "libffrt.a"
+        if not exe.is_file() or not rt_lib.is_file():
+            return False, "", None
+        want_stamp = self._runtime_stamp()
+        if not want_stamp:
+            return False, "", None
+        stamp_path = self._runtime_stamp_path()
+        raw_have = stamp_path.read_text(encoding="utf-8", errors="ignore").strip() if stamp_path.is_file() else ""
+        have_stamp, rec_exe_size = self._parse_stored_stamp(raw_have)
+        exe_size = exe.stat().st_size
+        stale = (
+            (have_stamp != want_stamp)
+            or (rec_exe_size is not None and rec_exe_size != exe_size)
+            or (rt_lib.stat().st_mtime > exe.stat().st_mtime + 1.0)
+        )
+        if not stale:
+            return False, "", None
+        exefs = self._resolve_exefs()
+        packed_romfs = self._resolve_packed_romfs()
+        gen_dir = self.root_dir / "work" / "generated" / "ff100"
+        missing: list[str] = []
+        if exefs is None or not exefs.is_dir():
+            missing.append("exefs")
+        if packed_romfs is None:
+            missing.append("romfs_packed")
+        if not (gen_dir / "layout.json").is_file():
+            missing.append("work/generated/ff100")
+        if missing:
+            return True, "missing " + ", ".join(missing), None
+        assert exefs is not None and packed_romfs is not None
+        return True, "runtime updated", (exefs, packed_romfs, gen_dir, want_stamp, have_stamp)
+
+    def _write_refresh_log(self, lines: list[str]) -> None:
+        try:
+            log_dir = self._logs_dir()
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / "refresh.log"
+            stamp = datetime.now().isoformat(timespec="seconds")
+            body = f"=== [{stamp}] FFLauncher runtime refresh ({self.version}) ===\n" + "\n".join(lines) + "\n\n"
+            with log_file.open("a", encoding="utf-8", errors="replace") as f:
+                f.write(body)
+        except OSError:
+            pass
 
     def _sync_staged_bin_files(self) -> None:
         if not self._exe_path().is_file():
@@ -2041,54 +2198,67 @@ class FFLauncherApp(tk.Tk):
         except OSError:
             pass
 
-    def _auto_refresh_existing_build(self) -> None:
+    def _auto_refresh_existing_build(self, launch_after: bool = False) -> None:
+        # Read installed translator ID before _sync_staged_bin_files overwrites it, so upgrades from
+        # older installs without .ff_runtime_stamp avoid unnecessary 50s shader re-warms.
+        root_xlate_id = self.root_dir / "ns2_xlate.id"
+        prev_root_xlate = (
+            root_xlate_id.read_text(encoding="utf-8", errors="ignore").strip() if root_xlate_id.is_file() else ""
+        )
         self._sync_staged_bin_files()
         if self.setup_running or self.refresh_running or self.update_in_progress:
             return
-        exe = self._exe_path()
-        exefs = self.root_dir / "exefs"
-        packed_romfs = self._resolve_packed_romfs()
-        gen_dir = self.root_dir / "work" / "generated" / "ff100"
-        rt_lib = self.root_dir / "runtime" / "libffrt.a"
-        if not (
-            exe.is_file()
-            and exefs.is_dir()
-            and packed_romfs is not None
-            and (gen_dir / "layout.json").is_file()
-            and rt_lib.is_file()
-        ):
-            return
-        want_stamp = self._runtime_stamp()
-        if not want_stamp:
-            return
-        stamp_path = self._runtime_stamp_path()
-        have_stamp = stamp_path.read_text(encoding="utf-8", errors="ignore").strip() if stamp_path.is_file() else ""
-        stale = (have_stamp != want_stamp) or (rt_lib.stat().st_mtime > exe.stat().st_mtime + 1.0)
+        stale, reason, refresh_args = self._stale_build_status()
         if not stale:
             return
-        if game_process_warning(self.root_dir, "updating ff.exe") is not None:
+        if refresh_args is None:
+            self._write_refresh_log([f"Skipped auto-refresh: {reason}"])
+            self._refresh_status_cards()
             return
+        exefs, packed_romfs, gen_dir, want_stamp, have_stamp = refresh_args
+        running_warn = game_process_warning(self.root_dir, "updating ff.exe")
+        if running_warn is not None:
+            self._last_refresh_error = "Close running ff.exe so the launcher can update it."
+            self._write_refresh_log([f"Deferred auto-refresh: {running_warn}"])
+            self._refresh_status_cards()
+            if launch_after:
+                messagebox.showwarning(APP_TITLE, running_warn, parent=self)
+            return
+        self._last_refresh_error = None
+        self._launch_after_refresh = bool(launch_after)
         self.refresh_running = True
-        self.play_btn.configure(state=tk.DISABLED)
-        self.build_state_lbl.configure(text=f"Updating ff.exe for {self.version}…", fg=C_WARN)
+        self._refresh_status_cards()
         threading.Thread(
             target=self._run_refresh_worker,
-            args=(exefs, packed_romfs, gen_dir, want_stamp, have_stamp),
+            args=(exefs, packed_romfs, gen_dir, want_stamp, have_stamp, prev_root_xlate),
             daemon=True,
         ).start()
 
     def _run_refresh_worker(
-        self, exefs: Path, packed_romfs: Path, gen_dir: Path, want_stamp: str, have_stamp: str = ""
+        self,
+        exefs: Path,
+        packed_romfs: Path,
+        gen_dir: Path,
+        want_stamp: str,
+        have_stamp: str = "",
+        prev_root_xlate: str = "",
     ) -> None:
         err: str | None = None
+        log_lines: list[str] = [
+            f"exefs={exefs}",
+            f"packed_romfs={packed_romfs}",
+            f"gen_dir={gen_dir}",
+            f"have_stamp={have_stamp or '<none>'}",
+            f"want_stamp={want_stamp}",
+        ]
         try:
             py = self._find_setup_python()
-            env = dict(os.environ)
-            for d in (self.root_dir / "python", self.root_dir / "llvm" / "bin", self.root_dir / "bin"):
-                if d.is_dir():
-                    env["PATH"] = str(d) + os.pathsep + env.get("PATH", "")
+            env = self._clean_tool_env()
             build_out = self.root_dir / "work" / "build" / "ff100"
             build_out.mkdir(parents=True, exist_ok=True)
+            # Always drop cached build_out/ff.exe before relinking so Ninja never skips relinking
+            # when a manually extracted Update.zip preserves older timestamps on libffrt.a.
+            (build_out / "ff.exe").unlink(missing_ok=True)
             cmd = self._build_game_cmd(
                 py,
                 gen_dir=gen_dir,
@@ -2096,6 +2266,7 @@ class FFLauncherApp(tk.Tk):
                 exefs=exefs,
                 packed_romfs=packed_romfs,
             )
+            log_lines.append("cmd=" + " ".join(cmd))
             proc = subprocess.run(
                 cmd,
                 cwd=str(self.root_dir),
@@ -2107,15 +2278,34 @@ class FFLauncherApp(tk.Tk):
                 errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            if proc.stdout:
+                log_lines.append(proc.stdout.rstrip())
+            log_lines.append(f"build_game exit={proc.returncode}")
             if proc.returncode != 0:
-                tail = "\n".join((proc.stdout or "").strip().splitlines()[-8:])
+                tail = "\n".join((proc.stdout or "").strip().splitlines()[-10:])
                 raise RuntimeError(f"Runtime update build failed (exit {proc.returncode}):\n{tail}")
-            for fname in ("ff.exe", "ns2_xlate.exe", "ns2_xlate.id", "SDL3.dll", "libopus-0.dll"):
+            src_exe = build_out / "ff.exe"
+            if not src_exe.is_file():
+                raise RuntimeError(f"Runtime update build did not produce {src_exe}")
+            src_size = src_exe.stat().st_size
+            src_sha = sha256_file(src_exe)
+            dst_exe = self._exe_path()
+            tmp_exe = self.root_dir / "ff.exe.update-new"
+            shutil.copy2(src_exe, tmp_exe)
+            os.replace(tmp_exe, dst_exe)
+            dst_size = dst_exe.stat().st_size
+            dst_sha = sha256_file(dst_exe)
+            if dst_size != src_size or dst_sha != src_sha:
+                raise RuntimeError(
+                    f"Copied ff.exe verification mismatch (src={src_size}/{src_sha[:12]}, dst={dst_size}/{dst_sha[:12]})"
+                )
+            log_lines.append(f"verified ff.exe: size={dst_size} sha256={dst_sha[:16]}")
+            for fname in ("ns2_xlate.exe", "ns2_xlate.id", "SDL3.dll", "libopus-0.dll"):
                 src = build_out / fname
                 if src.is_file():
                     shutil.copy2(src, self.root_dir / fname)
             self._sync_staged_bin_files()
-            old_xlate = have_stamp.rsplit("|", 1)[-1].strip() if "|" in have_stamp else ""
+            old_xlate = (have_stamp.rsplit("|", 1)[-1].strip() if "|" in have_stamp else "") or prev_root_xlate
             new_xlate = want_stamp.rsplit("|", 1)[-1].strip() if "|" in want_stamp else ""
             can_reuse_shaders = (
                 bool(old_xlate)
@@ -2123,9 +2313,10 @@ class FFLauncherApp(tk.Tk):
                 and (self.root_dir / "shader-programs.bin").is_file()
                 and (self.root_dir / "pipeline-keys.bin").is_file()
             )
+            log_lines.append(f"shaders: can_reuse={can_reuse_shaders} old_xlate={old_xlate[:12]} new_xlate={new_xlate[:12]}")
             if can_reuse_shaders:
                 subprocess.run(
-                    [str(self._exe_path()), "--prepare-shaders"],
+                    [str(dst_exe), "--prepare-shaders"],
                     cwd=str(self.root_dir),
                     env=env,
                     stdout=subprocess.DEVNULL,
@@ -2135,21 +2326,34 @@ class FFLauncherApp(tk.Tk):
             else:
                 # An update can bring a new shader translator, which starts a new cache: warm it again.
                 self._prewarm_shaders(py, env, exefs, packed_romfs, 0, 100)
-            stamp_path = self._runtime_stamp_path()
-            stamp_path.parent.mkdir(parents=True, exist_ok=True)
-            stamp_path.write_text(want_stamp + "\n", encoding="utf-8")
+            self._write_runtime_stamp(exe_size=dst_size)
+            log_lines.append("refresh complete: OK")
         except Exception as exc:
             err = str(exc)
+            log_lines.append(f"ERROR: {err}")
         finally:
+            self._write_refresh_log(log_lines)
             self.after(0, lambda e=err: self._finish_refresh_worker(e))
 
     def _finish_refresh_worker(self, err: str | None) -> None:
         self.refresh_running = False
+        self._last_refresh_error = err
+        launch_now = self._launch_after_refresh and err is None
+        self._launch_after_refresh = False
         self._refresh_status_cards()
         if err:
-            self.build_hint_lbl.configure(text=err.splitlines()[0], fg=C_BAD)
+            messagebox.showerror(
+                f"{APP_TITLE} — ff.exe Update Failed",
+                f"Could not relink ff.exe for {self.version}:\n\n{err[:500]}\n\nFull details were written to logs\\refresh.log.",
+                parent=self,
+            )
         else:
-            self.build_hint_lbl.configure(text=f"Updated {self._exe_path().name} to {self.version}. Press PLAY to launch.")
+            self.build_hint_lbl.configure(
+                text=f"Updated {self._exe_path().name} to {self.version}. Press PLAY to launch.",
+                fg=C_OK,
+            )
+            if launch_now:
+                self.launch_game()
 
     def check_for_updates(self) -> None:
         if getattr(self, "release_check_active", False) or getattr(self, "update_in_progress", False):

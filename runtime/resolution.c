@@ -631,35 +631,26 @@ static void ff_read_guest_cstr(uint64_t ptr, char *out, size_t cap) {
     out[i] = 0;
 }
 
-static int ff_is_aux_buffer(const char *name) {
-    if (ff_streqi(name, "map") || ff_streqi(name, "mapdepth")) return 1;
-    if (ff_strcasestr(name, "gtao res") && !ff_strcasestr(name, "depthres")) return 1;
-    static const char *const kAux[] = {
-        "shadow", "cube", "dummy", "temp", "mip", "bloom", "streak", "godray",
-        "flare", "sao", "blur", "fog", "lut", "tile", "exposure", "scaledown",
-        "downsample", "downsize", "downscale", "pingpong", "bilateral",
-    };
-    for (size_t i = 0; i < sizeof kAux / sizeof *kAux; i++) {
-        if (ff_strcasestr(name, kAux[i])) return 1;
-    }
-    return 0;
+static int ff_is_ortho_preview_buffer(const char *name) {
+    // Menu / Fusion Shop 3D preview framebuffers are composited onto orthoInfoCam's fixed 1920x1080
+    // virtual coordinate space using the texture's pixel dimensions (bigVehicleGeoTrans). Lifting
+    // them to 4K scales the preview quad by 2x (vehicleCb) or 2.16x (Fusion Shop cb).
+    return ff_streqi(name, "vehiclecb") || ff_streqi(name, "vehicledb") ||
+           ff_streqi(name, "cb") || ff_streqi(name, "db");
 }
 
 static int ff_is_canvas_buffer(const char *name) {
-    return ff_strcasestr(name, "framebuffer") || ff_strcasestr(name, "cbhud") || ff_strcasestr(name, "cdlss::");
+    return ff_strcasestr(name, "framebuffer") || ff_strcasestr(name, "cbhud") ||
+           ff_strcasestr(name, "displaybuffer") || ff_strcasestr(name, "screentransition") ||
+           ff_streqi(name, "disp0") || ff_streqi(name, "disp1") || ff_streqi(name, "disp2");
 }
 
 static int ff_is_scene_target(const char *name) {
-    static const char *const kScene[] = {
-        "dyna_cb", "dyna_db", "vehiclecb", "vehicledb", "deferred", "smoothnormals",
-        "fxcapture", "gtao depthres", "screenspacereflection", "reflectionstarget",
-        "reflection_distance_depth", "motionblur", "renderqueue_depthcopy",
-        "screentransition", "displaybuffer", "disp0", "disp1", "disp2",
-    };
-    for (size_t i = 0; i < sizeof kScene / sizeof *kScene; i++) {
-        if (ff_strcasestr(name, kScene[i])) return 1;
-    }
-    return 0;
+    // Only lift the main 3D race framebuffer directly; its derived G-buffers, depth copy,
+    // reflections, GTAO, motionBlur, and DLSS targets automatically inherit their owning
+    // framebuffer's resolution (and half-res effects stay proportional at 1/2 instead of
+    // being inflated to full 4K).
+    return ff_streqi(name, "dyna_cb") || ff_streqi(name, "dyna_db");
 }
 
 static void ff_log_buffer_once(const char *kind, const char *name, uint32_t ow, uint32_t oh,
@@ -696,10 +687,18 @@ static void ff_maybe_lift_buffer(uint64_t desc, uint32_t name_off, const char *k
     ff_read_guest_cstr(name_ptr, name, sizeof name);
     int is_16_9 = (w >= 1280u && w <= 7680u && h >= 720u && (uint64_t)w * 9u == (uint64_t)h * 16u);
     if (!is_16_9) return;
+    if (!name[0]) {
+        ff_log_buffer_once(kind, "<unnamed>", w, h, w, h, "aux/skip");
+        return;
+    }
+    if (ff_is_ortho_preview_buffer(name)) {
+        ff_log_buffer_once(kind, name, w, h, w, h, "ortho-preview/keep");
+        return;
+    }
     int is_canvas = ff_is_canvas_buffer(name);
     int is_scene = !is_canvas && ff_is_scene_target(name);
-    if (!name[0] || (!is_canvas && !is_scene && ff_is_aux_buffer(name))) {
-        ff_log_buffer_once(kind, name[0] ? name : "<unnamed>", w, h, w, h, "aux/skip");
+    if (!is_canvas && !is_scene) {
+        ff_log_buffer_once(kind, name, w, h, w, h, "derived/keep");
         return;
     }
     uint32_t cw = 0, ch = 0, sw = 0, sh = 0;
@@ -744,7 +743,23 @@ void __wrap_f_700002c764(Cpu *c) {
         if (res_ff_enabled()) {
             uint32_t cw = 0, ch = 0;
             ff_get_target_resolutions(&cw, &ch, NULL, NULL);
-            float new_scale = 1.0f, fw = (float)cw, fh = (float)ch;
+            uint32_t out_w = cw, out_h = ch;
+            int is_ortho_preview = 0;
+            char cb_name[64] = {0};
+            if (c->x[3] && plat_mem_readable(c->x[3], 8u)) {
+                uint64_t cb = LD64(c->x[3]);
+                if (cb && plat_mem_readable(cb + 0x88ull, 0x48u)) {
+                    uint32_t fb_w = LD32(cb + 0x88ull);
+                    uint32_t fb_h = LD32(cb + 0x8cull);
+                    ff_read_guest_cstr(LD64(cb + 0xc8ull), cb_name, sizeof cb_name);
+                    if (ff_is_ortho_preview_buffer(cb_name) && fb_w >= 320u && fb_h >= 180u) {
+                        out_w = fb_w;
+                        out_h = fb_h;
+                        is_ortho_preview = 1;
+                    }
+                }
+            }
+            float new_scale = 1.0f, fw = (float)out_w, fh = (float)out_h;
             uint32_t us = 0, uw = 0, uh = 0;
             memcpy(&us, &new_scale, 4);
             memcpy(&uw, &fw, 4);
@@ -752,12 +767,19 @@ void __wrap_f_700002c764(Cpu *c) {
             ST32(c->x[2] + 0x2bcull, us);
             ST32(c->x[2] + 0x2c0ull, uw);
             ST32(c->x[2] + 0x2c4ull, uh);
-            if (old_scale != 1.0f || old_w != fw || old_h != fh) {
+            if (is_ortho_preview) {
+                static int logged_prev = 0;
+                if (!logged_prev) {
+                    logged_prev = 1;
+                    rt_log("ff: C3dFxDlss (%s) kept ortho-preview 1:1 out=%ux%u (was %.0fx%.0f)",
+                           cb_name, out_w, out_h, old_w, old_h);
+                }
+            } else if (old_scale != 1.0f || old_w != fw || old_h != fh) {
                 static int logged = 0;
                 if (!logged) {
                     logged = 1;
-                    rt_log("ff: C3dFxDlss scale=%.3f->1.000 out=%.0fx%.0f->%ux%u",
-                           old_scale, old_w, old_h, cw, ch);
+                    rt_log("ff: C3dFxDlss (%s) scale=%.3f->1.000 out=%.0fx%.0f->%ux%u",
+                           cb_name[0] ? cb_name : "scene", old_scale, old_w, old_h, out_w, out_h);
                 }
             }
         } else {

@@ -55,6 +55,7 @@ int game_profile_has(uint32_t quirk) {
 
 void game_profile_log(void) {
     const RtGameProfile *p = game_profile();
-    rt_log("profile: '%s' (%s, title_id=%016llx, quirks=%#x)",
-           p->display_name, p->short_name, (unsigned long long)p->title_id, p->quirks);
+    rt_log("profile: '%s' (%s, title_id=%016llx, quirks=%#x, port=%s)",
+           p->display_name, p->short_name, (unsigned long long)p->title_id, p->quirks,
+           rt_port_version[0] ? rt_port_version : "unknown");
 }

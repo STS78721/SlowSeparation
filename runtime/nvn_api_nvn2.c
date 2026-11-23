@@ -304,11 +304,11 @@ NVN_API(nvnDlssNetworkBuilderSetOutputResolution) {
     uint32_t in_w = (uint32_t)arg_x(c, 1);
     uint32_t in_h = (uint32_t)arg_x(c, 2);
     uint32_t out_w = in_w, out_h = in_h;
-    if (res_ff_enabled()) {
+    if (res_ff_enabled() && (!out_w || !out_h)) {
         uint32_t cw = 0, ch = 0;
         ff_get_target_resolutions(&cw, &ch, NULL, NULL);
-        if (cw > 0) out_w = cw;
-        if (ch > 0) out_h = ch;
+        if (!out_w && cw > 0) out_w = cw;
+        if (!out_h && ch > 0) out_h = ch;
     }
     if (b) {
         b->out_w = out_w;
@@ -340,8 +340,10 @@ NVN_API(nvnDlssNetworkBuilderGetOptimalSettings) {
     if (res_ff_enabled()) {
         uint32_t cw = 0, ch = 0, sw = 0, sh = 0;
         ff_get_target_resolutions(&cw, &ch, &sw, &sh);
-        if (sw > 0) w = sw;
-        if (sh > 0) h = sh;
+        if (b && b->out_w == cw && b->out_h == ch) {
+            if (sw > 0) w = sw;
+            if (sh > 0) h = sh;
+        }
     }
     rt_log("dlss: GetOptimalSettings out=%ux%u optimal_scene=%ux%u method=%u preset=%u (lr=%#llx)",
            b ? b->out_w : 0, b ? b->out_h : 0, w, h, b ? b->method : 0, b ? b->preset : 0, (unsigned long long)c->x[30]);

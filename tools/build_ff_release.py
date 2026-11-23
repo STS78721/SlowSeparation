@@ -69,7 +69,7 @@ def read_version() -> str:
     if p.is_file():
         # utf-8-sig drops a PowerShell/Notepad BOM that would poison package filenames.
         return p.read_text(encoding="utf-8-sig").strip().splitlines()[0].strip()
-    return "Alpha 0.1.2b"
+    return "Alpha 0.1.2c"
 
 
 def version_slug(ver: str) -> str:
@@ -490,16 +490,18 @@ def pack_setup_with_py314(py314: Path, stub: Path, stage: Path, out_exe: Path, v
         "    f.write(struct.pack('<Q', off) + MAGIC)\n"
         "print(f'{out_exe}: {len(files)} files ({total/2**20:.1f} MiB -> {out_exe.stat().st_size/2**20:.1f} MiB)')\n"
     )
-    run([py314 / "python.exe", "-I", "-c", script, stub, stage, out_exe, ver, str(level)], env=clean_env(py314))
+    run([py314 / "python.exe", "-B", "-I", "-c", script, stub, stage, out_exe, ver, str(level)], env=clean_env(py314))
 
 
 def write_release_zips(stage: Path, out_dir: Path, slug: str) -> None:
     files = sorted(p for p in stage.rglob("*") if p.is_file())
+    now = time.gmtime()
+    zip_time = (max(now.tm_year, 1980), now.tm_mon, now.tm_mday, now.tm_hour, now.tm_min, now.tm_sec)
     for kind in ("Portable-StandAlone", "Update"):
         out_zip = out_dir / f"SteelTemple-FF-SlowSeparation-{slug}-{kind}.zip"
         with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
             for p in files:
-                info = zipfile.ZipInfo("FF-SlowSeparation/" + p.relative_to(stage).as_posix(), (2026, 1, 1, 0, 0, 0))
+                info = zipfile.ZipInfo("FF-SlowSeparation/" + p.relative_to(stage).as_posix(), zip_time)
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = 0o644 << 16
                 z.writestr(info, p.read_bytes(), compresslevel=6)

@@ -1223,13 +1223,9 @@ static void perf_picture(const MenuTarget *t, const ImVec4 &c) {
     } else {
         snprintf(v[4], sizeof v[4], !strcmp(ref, "boost") ? "Low Latency (Boost)" : !strcmp(ref, "on") ? "Low Latency (On)" : "Off");
     }
-    int fg_mult = vk_fg_active_multiplier();
     const char *fg_m = cfg_value("NS2_FG_MODE");
-    if (fg_mult > 1 && fg_m && strcmp(fg_m, "off") != 0) {
-        const char *gen = !strcmp(fg_m, "msm_fg") ? "Nodix Super Motion"
-                        : !strcmp(fg_m, "fsr3_fg") ? "FSR 3.1 FG"
-                        : !strcmp(fg_m, "xefg") ? "XeSS MFG" : "Super Motion";
-        snprintf(v[5], sizeof v[5], "%s (%dx Active)", gen, fg_mult);
+    if (fg_m && strcmp(fg_m, "off") != 0) {
+        snprintf(v[5], sizeof v[5], "Off (Not active yet)");
     } else {
         snprintf(v[5], sizeof v[5], "Off");
     }

@@ -321,7 +321,31 @@ static void window_main(void *arg) {
     wchar_t title_w[128];
     const char *dn = game_profile()->display_name;
     swprintf(title_w, sizeof title_w / sizeof title_w[0], L"%hs (PC Recomp)", (dn && *dn) ? dn : "Universal NS2 Title");
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, title_w, WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, ow, oh, NULL,
+    int start_fs = !background && cfg_fullscreen();
+    int wx = CW_USEDEFAULT, wy = CW_USEDEFAULT, ww = ow, wh = oh;
+    DWORD wstyle = WND_STYLE;
+    if (start_fs) {
+        MONITORINFO mi = {sizeof mi};
+        if (GetMonitorInfoW(MonitorFromPoint((POINT){0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            wstyle = WS_POPUP;
+            wx = mi.rcMonitor.left;
+            wy = mi.rcMonitor.top;
+            ww = mi.rcMonitor.right - mi.rcMonitor.left;
+            wh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+            // Seed windowed restore placement cleanly for F11 toggle back to windowed.
+            int work_w = mi.rcWork.right - mi.rcWork.left;
+            int work_h = mi.rcWork.bottom - mi.rcWork.top;
+            int rx = mi.rcWork.left + (work_w > ow ? (work_w - ow) / 2 : 0);
+            int ry = mi.rcWork.top + (work_h > oh ? (work_h - oh) / 2 : 0);
+            g_saved_place.length = sizeof g_saved_place;
+            g_saved_place.flags = 0;
+            g_saved_place.showCmd = SW_SHOWNORMAL;
+            g_saved_place.rcNormalPosition = (RECT){rx, ry, rx + ow, ry + oh};
+        } else {
+            start_fs = 0;
+        }
+    }
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, title_w, wstyle, wx, wy, ww, wh, NULL,
                              NULL, inst, NULL);
     if (!g_hwnd) {
         rt_log("gfx: CreateWindowEx failed (%lu)", GetLastError());
@@ -334,10 +358,14 @@ static void window_main(void *arg) {
         ImmAssociateContext(g_hwnd, NULL);
         // The frame was measured at the system DPI; the window may have opened on a monitor at another scale.
         plat_xchg32(&g_dpi, (int32_t)GetDpiForWindow(g_hwnd));
-        outer_size(g_hwnd, cw, ch, &ow, &oh);
-        SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (!start_fs) {
+            outer_size(g_hwnd, cw, ch, &ow, &oh);
+            SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        } else {
+            SetWindowPos(g_hwnd, HWND_TOP, wx, wy, ww, wh, SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        }
         if (!background) {
-            g_fs_pending = cfg_fullscreen();
+            g_fs_pending = !start_fs && cfg_fullscreen();
             raise_window(g_hwnd);   // a frontend's player may have no way to reach a window left behind
             FLASHWINFO fw = {.cbSize = sizeof fw, .hwnd = g_hwnd, .dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG};
             FlashWindowEx(&fw);
