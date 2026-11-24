@@ -5,7 +5,14 @@
 // Bits of libnx HidNpadButton (A=0 B=1 X=2 Y=3 StickL=4 StickR=5 L=6 R=7 ZL=8 ZR=9 Plus=10 Minus=11 Left=12 Up=13 Right=14
 // Down=15) and the stick directions (StickLLeft..Down 16-19, StickRLeft..Down 20-23, derived from the sticks).
 // Sticks are -32767..32767, up is +y. TOTK_INPUT=none reports no input. Callable from any thread.
+#define INPUT_MAX_PLAYERS 4
 void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
+// Poll a specific player slot (0..INPUT_MAX_PLAYERS-1): player 0 = gamepad 0 + keyboard/mouse; players 1..3 = gamepads 1..3.
+void input_poll_player(int player, uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
+// Returns 1 if a physical SDL gamepad is currently connected in slot `player` (0..INPUT_MAX_PLAYERS-1).
+int input_pad_connected(int player);
+// Returns how many physical SDL gamepads are currently connected (0..INPUT_MAX_PLAYERS).
+int input_pad_count(void);
 // The same for host UI (the text entry): never blocked. input_block(1) while a text entry is open: input_poll then
 // reports nothing; input_block(0) when it closes: nothing until all buttons and stick directions are released.
 void input_poll_ui(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
@@ -52,6 +59,7 @@ int input_cursor_released(void);   // Esc or a non-client activation released th
 // Rumble: SDL_RumbleGamepad on the open gamepad, low (heavy, left) and high (light, right) motor 0..65535 for ms
 // milliseconds. 1 if a gamepad with rumble took it. Callable from any thread.
 int input_rumble(uint16_t low, uint16_t high, uint32_t ms);
+int input_rumble_player(int player, uint16_t low, uint16_t high, uint32_t ms);
 // Motor value for a normalised amplitude: pow(a, curve) * strength, saturated to 0..65535. Pure.
 uint16_t rumble_motor(float a, float curve, float strength);
 // TOTK_RUMBLE_TRIGGERS=1: input_rumble also drives the impulse triggers (Xbox) with the high motor's value.
@@ -75,7 +83,8 @@ typedef struct {
 _Static_assert(sizeof(MotionState) == 0x60, "SixAxisSensorState ABI");
 typedef struct MotionFusion MotionFusion;
 MotionFusion *motion_new(void);
-MotionFusion *motion_global(void);   // the gamepad's, fed by input_win.c
+MotionFusion *motion_global(void);              // player 0's gamepad, fed by input.c
+MotionFusion *motion_player(int player);        // per-player gamepad motion (0..INPUT_MAX_PLAYERS-1)
 void motion_feed(MotionFusion *m, const double acc_g[3], const double gyro_rad_s[3], uint64_t now_ns);
 int motion_read(MotionFusion *m, MotionState *out, int max, uint64_t now_ns);   // newest first; 0 = none in 200 ms
 void motion_restart(MotionFusion *m);   // angle and direction start over at the next sample

@@ -5,6 +5,19 @@ below come from the shared Universal NS2 to PC history this project is built on.
 
 ---
 
+## [Alpha 0.1.2d] - 2026-11-24
+
+### 🎮 4-Player Local Split-Screen Multi-Controller Support & P1 Profile Avatar Fix
+- **4-Player Local Multi-Controller Support (`runtime/input.h`, `runtime/input.c`, `runtime/motion_fusion.c`, `runtime/ov_input.c`, `runtime/ui/menu.cpp`):**
+  - Expanded host controller handling from a single pad to up to **4 simultaneous controllers** (`P1`–`P4`) with stable per-slot assignment, player LED indices (`SDL_SetGamepadPlayerIndex`), and automatic hot-plug / unplug rescanning without shifting remaining players.
+  - Added independent per-slot button layout detection (`pad_layout = auto`), so mixed DualSense, Xbox, and Switch Pro controllers all map face buttons accurately at the same time.
+  - Updated `nn::hid` Npad state queries, `SetSupportedNpadIdType`, `GetNpadStyleSet`, `DisconnectNpad`, and `ShowControllerSupport` (plus `ControllerSupportArg::SetDefault()`) to report all connected players (`1`–`4`) cleanly for 2P / 3P / 4P split-screen multiplayer.
+  - Routed per-player HD Rumble and Six-Axis motion sensors independently across all 4 slots, and updated the full performance overlay to show total connected controllers.
+- **Fixed corrupted P1 profile icon in Multiplayer (`runtime/ov_system.c`):**
+  - Replaced the 1×1 grayscale stub JPEG in `nn::account::LoadProfileImage` (which Nintendo's JPEG decoder rejected, leaving uninitialized memory static in P1's avatar slot) with a spec-compliant `256×256` baseline YCbCr 4:2:0 JPEG (`P1` blue checkerboard badge matching the `Guest` icons) and added a buffer-size guard.
+
+---
+
 ## [Alpha 0.1.2c] - 2026-11-23
 
 ### 🛠️ Menu Ship Zoom, Auto-Relink, Windows HDR & Clean Defaults Hotfix

@@ -28,11 +28,44 @@ enum { STYLE_FULL_KEY = 1, STYLE_HANDHELD = 2, ATTR_CONNECTED = 1 };
 
 static PlatMutex lock = PLAT_MUTEX_INIT;
 static uint32_t styles = STYLE_FULL_KEY;
-static int enabled, allowed = 1, mouse_ready, keyboard_ready;
+static uint32_t supported_mask = 0x1ffu;      // bits 0..7 = No1..No8, bit 8 = Handheld (0x20)
+static uint32_t disconnected_mask;
+static int enabled, mouse_ready, keyboard_ready;
 static int64_t sample;
 
 static uint32_t pad_id(void) { return ov_handheld() ? 0x20u : 0u; }
-static uint32_t pad_style(void) { return ov_handheld() ? STYLE_HANDHELD : STYLE_FULL_KEY; }
+
+static uint32_t npad_id_bit(uint32_t id) {
+    if (id < 8u) return 1u << id;
+    if (id == 0x20u) return 1u << 8;
+    return 0u;
+}
+
+// Resolve a Switch NpadIdType to a host player slot (0..INPUT_MAX_PLAYERS-1) and style, or -1 if not connected.
+// Player 1 (No1 in docked, Handheld in handheld) is always connected (gamepad 0 + keyboard/mouse); players 2..4
+// (No2..No4) are connected whenever a corresponding SDL gamepad is present.
+static int npad_slot_for_id(uint32_t id, uint32_t *out_style) {
+    if (ov_handheld()) {
+        if (id == 0x20u) {
+            if (out_style) *out_style = STYLE_HANDHELD;
+            return 0;
+        }
+        if (id >= 1u && id < (uint32_t)INPUT_MAX_PLAYERS && input_pad_connected((int)id)) {
+            if (out_style) *out_style = STYLE_FULL_KEY;
+            return (int)id;
+        }
+        return -1;
+    }
+    if (id == 0u) {
+        if (out_style) *out_style = STYLE_FULL_KEY;
+        return 0;
+    }
+    if (id >= 1u && id < (uint32_t)INPUT_MAX_PLAYERS && input_pad_connected((int)id)) {
+        if (out_style) *out_style = STYLE_FULL_KEY;
+        return (int)id;
+    }
+    return -1;
+}
 
 static const uint32_t *need_id(Cpu *c, int i, const char *fn) {
     const uint32_t *id = arg_p(c, i);
@@ -43,11 +76,12 @@ static const uint32_t *need_id(Cpu *c, int i, const char *fn) {
 // void InitializeNpad()
 static void ov_initialize_npad(Cpu *c) {
     (void)c;
+    int n = input_pad_count();
     plat_mutex_lock(&lock);
     enabled = 1;
     plat_mutex_unlock(&lock);
-    rt_log("hid: controllers initialized (one connected %s controller)",
-           ov_handheld() ? "handheld" : "full-key");
+    rt_log("hid: controllers initialized (%d gamepad(s) connected, %s mode, up to %d players)",
+           n, ov_handheld() ? "handheld" : "full-key", INPUT_MAX_PLAYERS);
 }
 
 // void SetSupportedNpadIdType(const NpadIdType *ids, size_t count)
@@ -55,10 +89,11 @@ static void ov_supported_ids(Cpu *c) {
     const uint32_t *ids = arg_p(c, 0);
     uint64_t n = arg_x(c, 1);
     if (n > 10 || (!ids && n)) rt_fatal("nn::hid::SetSupportedNpadIdType: invalid id list (%llu ids)", (unsigned long long)n);
-    int ok = 0;
-    for (uint64_t i = 0; i < n; i++) ok |= ids[i] == pad_id();
+    uint32_t mask = 0;
+    for (uint64_t i = 0; i < n; i++) mask |= npad_id_bit(ids[i]);
     plat_mutex_lock(&lock);
-    allowed = ok;
+    supported_mask = mask;
+    disconnected_mask &= ~mask;
     plat_mutex_unlock(&lock);
 }
 
@@ -72,8 +107,10 @@ static void ov_supported_styles(Cpu *c) {
 // NpadStyleSet GetNpadStyleSet(const NpadIdType &id)
 static void ov_style_set(Cpu *c) {
     uint32_t id = *need_id(c, 0, "GetNpadStyleSet");
+    uint32_t bit = npad_id_bit(id), pstyle = 0;
+    int slot = npad_slot_for_id(id, &pstyle);
     plat_mutex_lock_shared(&lock);
-    uint32_t v = enabled && allowed && id == pad_id() ? styles & pad_style() : 0;
+    uint32_t v = (enabled && slot >= 0 && (supported_mask & bit) && !(disconnected_mask & bit)) ? (styles & pstyle) : 0;
     plat_mutex_unlock_shared(&lock);
     ret_x(c, v);
 }
@@ -86,13 +123,16 @@ static void npad_states(Cpu *c, uint32_t want) {
     uint32_t id = *need_id(c, 2, "GetNpadStates");
     if (max <= 0) { ret_x(c, 0); return; }
     if (!out) rt_fatal("nn::hid::GetNpadStates: null output");
+    uint32_t bit = npad_id_bit(id), pstyle = 0;
+    int slot = want ? npad_slot_for_id(id, &pstyle) : -1;
     plat_mutex_lock(&lock);
     NpadState s = {.sampling = ++sample};
-    int live = want && enabled && allowed && id == pad_id() && want == pad_style() && (styles & want);
+    int live = want && enabled && slot >= 0 && (supported_mask & bit) && !(disconnected_mask & bit) &&
+               want == pstyle && (styles & want);
     plat_mutex_unlock(&lock);
     if (live) {
         s.attributes = ATTR_CONNECTED;
-        input_poll(&s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);
+        input_poll_player(slot, &s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);
     }
     *out = s;
     ret_x(c, 1);
@@ -107,13 +147,16 @@ static void npad_state(Cpu *c, uint32_t want) {
     NpadState *out = arg_p(c, 0);
     uint32_t id = *need_id(c, 1, "GetNpadState");
     if (!out) rt_fatal("nn::hid::GetNpadState: null output");
+    uint32_t bit = npad_id_bit(id), pstyle = 0;
+    int slot = want ? npad_slot_for_id(id, &pstyle) : -1;
     plat_mutex_lock(&lock);
     NpadState s = {.sampling = ++sample};
-    int live = want && enabled && allowed && id == pad_id() && want == pad_style() && (styles & want);
+    int live = want && enabled && slot >= 0 && (supported_mask & bit) && !(disconnected_mask & bit) &&
+               want == pstyle && (styles & want);
     plat_mutex_unlock(&lock);
     if (live) {
         s.attributes = ATTR_CONNECTED;
-        input_poll(&s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);
+        input_poll_player(slot, &s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);
     }
     *out = s;
 }
@@ -146,30 +189,58 @@ static void ov_controller_color_dual(Cpu *c) {
 }
 
 static void ov_controller_support_arg_default(Cpu *c) {
-    void *p = arg_p(c, 0);
-    if (p) memset(p, 0, 0x20);
+    uint8_t *p = arg_p(c, 0);
+    if (p) {
+        memset(p, 0, 0x20);
+        p[1] = INPUT_MAX_PLAYERS;   // playerCountMax
+        p[2] = 1;                   // enableTakeOverConnection
+        p[3] = 1;                   // enableLeftJustify
+        p[4] = 1;                   // enablePermitJoyDual
+    }
 }
 
 // void SetNpadJoyHoldType(NpadJoyHoldType type)
+static int hold_type = 0;
 static void ov_hold_type(Cpu *c) {
     int64_t t = (int32_t)arg_x(c, 0);
     if (t < 0 || t > 1) rt_fatal("nn::hid::SetNpadJoyHoldType: invalid hold type %lld", (long long)t);
+    hold_type = (int)t;
 }
+static void ov_get_hold_type(Cpu *c) { ret_x(c, (uint32_t)hold_type); }
 
-// void DisconnectNpad(const NpadIdType &id): only the controller in use (handheld mode disconnects player 1)
+// void DisconnectNpad(const NpadIdType &id)
 static void ov_disconnect(Cpu *c) {
     uint32_t id = *need_id(c, 0, "DisconnectNpad");
-    if (id != pad_id()) return;
+    uint32_t bit = npad_id_bit(id);
+    if (!bit) return;
     plat_mutex_lock(&lock);
-    allowed = 0;
+    disconnected_mask |= bit;
     plat_mutex_unlock(&lock);
 }
 
-// Result ShowControllerSupport(ControllerSupportResultInfo *out, const ControllerSupportArg &arg): the one controller
-// is already connected, so the applet returns at once with one player on it.
+// Result ShowControllerSupport(ControllerSupportResultInfo *out, const ControllerSupportArg &arg): report all
+// currently connected players (clamped to the game's requested max when non-zero) and clear disconnects.
+static void controller_support_common(ControllerSupportResult *out, const int8_t *arg) {
+    int n = input_pad_count();
+    if (n < 1) n = 1;
+    if (n > INPUT_MAX_PLAYERS) n = INPUT_MAX_PLAYERS;
+    int min_p = arg ? arg[0] : 0;
+    int max_p = arg ? arg[1] : 0;
+    if (max_p > 0 && n > max_p) n = max_p;
+    plat_mutex_lock(&lock);
+    disconnected_mask = 0;
+    plat_mutex_unlock(&lock);
+    if (out) *out = (ControllerSupportResult){.players = (int8_t)n, .selected = pad_id()};
+    rt_log("hid: ShowControllerSupport(min=%d, max=%d) -> %d player(s) (selected id %#x)", min_p, max_p, n, pad_id());
+}
+
 static void ov_controller_support(Cpu *c) {
-    ControllerSupportResult *out = arg_p(c, 0);
-    if (out) *out = (ControllerSupportResult){.players = 1, .selected = pad_id()};
+    controller_support_common(arg_p(c, 0), arg_p(c, 1));
+    ret_x(c, 0);
+}
+
+static void ov_controller_support_no_out(Cpu *c) {
+    controller_support_common(NULL, arg_p(c, 0));
     ret_x(c, 0);
 }
 
@@ -258,8 +329,6 @@ static void rumble_cfg(void) {
 }
 static uint16_t motor(float a) { return rumble_motor(a, rumble_curve, rumble_strength); }
 
-static uint32_t pad_style_index(void) { return ov_handheld() ? STYLE_INDEX_HANDHELD : STYLE_INDEX_FULL_KEY; }
-
 // The SDK's id check (utility functions): players 1-8, other (0x10) and handheld (0x20); the public functions abort
 // on another id.
 static uint32_t handle_id(Cpu *c, const char *fn) {
@@ -324,36 +393,43 @@ static const uint32_t *need_handle(const void *p, const char *fn) {
     return p;
 }
 
-// The vibration device (0 left, 1 right) a handle names on the connected controller, or -1 (logged once).
-static int vibration_side(const uint32_t *h, const char *fn) {
-    uint32_t v = *need_handle(h, fn), dev = v >> 16 & 0xff;
-    if ((v & 0xff) == pad_style_index() && (v >> 8 & 0xff) == pad_id() && dev < 2) return (int)dev;
+// Resolve a vibration handle to player slot (0..INPUT_MAX_PLAYERS-1) and side (0 left, 1 right), or -1.
+static int vibration_side(const uint32_t *h, const char *fn, int *out_player) {
+    uint32_t v = *need_handle(h, fn), sidx = v & 0xff, id = (v >> 8) & 0xff, dev = (v >> 16) & 0xff;
+    uint32_t pstyle = 0;
+    int slot = npad_slot_for_id(id, &pstyle);
+    uint32_t expect_idx = pstyle == STYLE_HANDHELD ? STYLE_INDEX_HANDHELD : STYLE_INDEX_FULL_KEY;
+    if (slot >= 0 && sidx == expect_idx && dev < 2) {
+        if (out_player) *out_player = slot;
+        return (int)dev;
+    }
     static volatile int32_t warned;
-    once(&warned, "hid: vibration call for handle %#x, not a device of the connected controller: ignored", v);
+    once(&warned, "hid: vibration call for handle %#x, not a device of a connected controller: ignored", v);
+    if (out_player) *out_player = -1;
     return -1;
 }
 
 static PlatMutex vib_lock = PLAT_MUTEX_INIT;
-static VibrationValue vib_last[2] = {{0, 160, 0, 320}, {0, 160, 0, 320}};   // vib_lock
-static uint64_t vib_at[2], sent_at;                                          // vib_lock
-static uint16_t sent_low, sent_high;                                         // vib_lock
-static int vib_allowed = 1;                                                  // vib_lock: PermitVibration
+static VibrationValue vib_last[INPUT_MAX_PLAYERS][2];     // vib_lock
+static uint64_t vib_at[INPUT_MAX_PLAYERS][2], sent_at[INPUT_MAX_PLAYERS];   // vib_lock
+static uint16_t sent_low[INPUT_MAX_PLAYERS], sent_high[INPUT_MAX_PLAYERS];  // vib_lock
+static int vib_allowed = 1;                               // vib_lock: PermitVibration
 
 static float clamp01(float v) { return v > 0 ? (v < 1 ? v : 1) : 0; }   // NaN -> 0
 // Share of a band at f Hz that goes to the light (high-frequency, right) motor: none at 160 Hz and below (the low band's
 // neutral frequency), all at 320 Hz and above (the high band's), log scale between.
 static float light_share(float f) { return f > 160 ? (f < 320 ? log2f(f / 160) : 1) : 0; }
 
-// Switch HD rumble -> SDL_RumbleGamepad. Each side's two bands split by frequency between the heavy (low) and the light
-// (high) motor (light_share) and add up as energy per motor (root of the summed squares); the stronger side drives each
-// motor. A side the game has not updated for 250 ms is silent. Each send lasts 250 ms and is renewed every 50 ms while
-// the game streams, so the pad stops by itself when the game stops sending (pause, freeze). Under vib_lock.
-static void rumble_update(uint64_t now) {
+// Switch HD rumble -> SDL_RumbleGamepad per player. Each side's two bands split by frequency between the heavy (low) and
+// the light (high) motor (light_share) and add up as energy per motor (root of the summed squares); the stronger side
+// drives each motor. A side the game has not updated for 250 ms is silent. Under vib_lock.
+static void rumble_update_player(int player, uint64_t now) {
+    if (player < 0 || player >= INPUT_MAX_PLAYERS) return;
     float heavy = 0, light = 0;
     rumble_cfg();
     for (int s = 0; s < 2 && vib_allowed; s++) {
-        if (!vib_at[s] || now - vib_at[s] > RUMBLE_STALE_NS) continue;
-        const VibrationValue *v = &vib_last[s];
+        if (!vib_at[player][s] || now - vib_at[player][s] > RUMBLE_STALE_NS) continue;
+        const VibrationValue *v = &vib_last[player][s];
         float al = clamp01(v->amp_low), ah = clamp01(v->amp_high), sl = light_share(v->freq_low), sh = light_share(v->freq_high);
         float h = sqrtf(al * (1 - sl) * al * (1 - sl) + ah * (1 - sh) * ah * (1 - sh));
         float l = sqrtf(al * sl * al * sl + ah * sh * ah * sh);
@@ -361,44 +437,47 @@ static void rumble_update(uint64_t now) {
         if (l > light) light = l;
     }
     uint16_t lo = motor(clamp01(heavy)), hi = motor(clamp01(light));
-    int changed = lo != sent_low || hi != sent_high, on = lo || hi;
-    if (changed ? on && now - sent_at < RUMBLE_MIN_GAP_NS : !on || now - sent_at < RUMBLE_REFRESH_NS) return;
-    input_rumble(lo, hi, on ? RUMBLE_MS : 0);
-    sent_low = lo, sent_high = hi, sent_at = now;
+    int changed = lo != sent_low[player] || hi != sent_high[player], on = lo || hi;
+    if (changed ? on && now - sent_at[player] < RUMBLE_MIN_GAP_NS : !on || now - sent_at[player] < RUMBLE_REFRESH_NS) return;
+    input_rumble_player(player, lo, hi, on ? RUMBLE_MS : 0);
+    sent_low[player] = lo, sent_high[player] = hi, sent_at[player] = now;
 }
 
-static void play(int side, const VibrationValue *v) {
+static void play(int player, int side, const VibrationValue *v) {
     if (!v) rt_fatal("nn::hid::detail::SendVibrationValue: null value");
-    if (side < 0) return;
+    if (player < 0 || player >= INPUT_MAX_PLAYERS || side < 0) return;
     VibrationValue c = *v;
     if (!isfinite(c.amp_low) || !isfinite(c.amp_high) || !isfinite(c.freq_low) || !isfinite(c.freq_high)) c = vib_neutral;
     static volatile int32_t first, first_on;
     if (!plat_xchg32(&first, 1))
-        rt_log("hid: first vibration value from the game: %s %.2f@%.0f Hz %.2f@%.0f Hz", side ? "right" : "left",
+        rt_log("hid: first vibration value from the game: P%d %s %.2f@%.0f Hz %.2f@%.0f Hz", player + 1, side ? "right" : "left",
                (double)c.amp_low, (double)c.freq_low, (double)c.amp_high, (double)c.freq_high);
     if ((c.amp_low > 0.01f || c.amp_high > 0.01f) && !plat_xchg32(&first_on, 1))
-        rt_log("hid: first non-zero vibration from the game: %s %.2f@%.0f Hz %.2f@%.0f Hz", side ? "right" : "left",
+        rt_log("hid: first non-zero vibration from the game: P%d %s %.2f@%.0f Hz %.2f@%.0f Hz", player + 1, side ? "right" : "left",
                (double)c.amp_low, (double)c.freq_low, (double)c.amp_high, (double)c.freq_high);
     uint64_t now = kern_now_ns();
     plat_mutex_lock(&vib_lock);
-    vib_last[side] = c;
-    vib_at[side] = now;
-    rumble_update(now);
+    vib_last[player][side] = c;
+    vib_at[player][side] = now;
+    rumble_update_player(player, now);
     plat_mutex_unlock(&vib_lock);
 }
 
 // Result detail::InitializeVibrationDevice(const VibrationDeviceHandle &)
 static void ov_vib_init(Cpu *c) {
-    static volatile int32_t logged;
+    static volatile int32_t logged[INPUT_MAX_PLAYERS];
     const uint32_t *h = arg_p(c, 0);
-    if (vibration_side(h, "InitializeVibrationDevice") >= 0)
-        once(&logged, "hid: the game initialized its vibration devices (handle %#x)", *h);
+    int player = -1;
+    if (vibration_side(h, "InitializeVibrationDevice", &player) >= 0 && player >= 0)
+        once(&logged[player], "hid: the game initialized vibration devices (handle %#x)", *h);
     ret_x(c, 0);
 }
 
 // Result detail::SendVibrationValue(const VibrationDeviceHandle &, const VibrationValue &)
 static void ov_vib_send(Cpu *c) {
-    play(vibration_side(arg_p(c, 0), "SendVibrationValue"), arg_p(c, 1));
+    int player = -1;
+    int side = vibration_side(arg_p(c, 0), "SendVibrationValue", &player);
+    play(player, side, arg_p(c, 1));
     ret_x(c, 0);
 }
 
@@ -408,7 +487,11 @@ static void ov_vib_send_many(Cpu *c) {
     const VibrationValue *v = arg_p(c, 1);
     int n = (int)arg_x(c, 2);
     if (n < 0 || (n && (!h || !v))) rt_fatal("nn::hid::detail::SendVibrationValues: invalid batch (%d values)", n);
-    for (int i = 0; i < n; i++) play(vibration_side(&h[i], "SendVibrationValues"), &v[i]);
+    for (int i = 0; i < n; i++) {
+        int player = -1;
+        int side = vibration_side(&h[i], "SendVibrationValues", &player);
+        play(player, side, &v[i]);
+    }
     ret_x(c, 0);
 }
 
@@ -416,10 +499,11 @@ static void ov_vib_send_many(Cpu *c) {
 static void ov_vib_actual(Cpu *c) {
     VibrationValue *out = arg_p(c, 0);
     if (!out) rt_fatal("nn::hid::detail::GetActualVibrationValue: null output");
-    int side = vibration_side(arg_p(c, 1), "GetActualVibrationValue");
+    int player = -1;
+    int side = vibration_side(arg_p(c, 1), "GetActualVibrationValue", &player);
     VibrationValue v = vib_neutral;
     plat_mutex_lock_shared(&vib_lock);
-    if (side >= 0) v = vib_last[side];
+    if (side >= 0 && player >= 0 && vib_at[player][side]) v = vib_last[player][side];
     plat_mutex_unlock_shared(&vib_lock);
     *out = v;
     ret_x(c, 0);
@@ -429,7 +513,7 @@ static void ov_vib_actual(Cpu *c) {
 static void ov_vib_info(Cpu *c) {
     VibrationDeviceInfo *out = arg_p(c, 0);
     if (!out) rt_fatal("nn::hid::detail::GetVibrationDeviceInfo: null output");
-    int side = vibration_side(arg_p(c, 1), "GetVibrationDeviceInfo");
+    int side = vibration_side(arg_p(c, 1), "GetVibrationDeviceInfo", NULL);
     *out = side >= 0 ? (VibrationDeviceInfo){1, (uint32_t)side + 1} : (VibrationDeviceInfo){0, 0};
     ret_x(c, 0);
 }
@@ -438,7 +522,7 @@ static void ov_vib_info(Cpu *c) {
 static void ov_vib_mounted(Cpu *c) {
     uint8_t *out = arg_p(c, 0);
     if (!out) rt_fatal("nn::hid::detail::IsVibrationDeviceMounted: null output");
-    *out = vibration_side(arg_p(c, 1), "IsVibrationDeviceMounted") >= 0;
+    *out = vibration_side(arg_p(c, 1), "IsVibrationDeviceMounted", NULL) >= 0;
     ret_x(c, 0);
 }
 
@@ -452,42 +536,48 @@ static void ov_vib_permitted(Cpu *c) {
     ret_x(c, 0);
 }
 
-// Result detail::PermitVibration(bool): off silences the gamepad at once
+// Result detail::PermitVibration(bool): off silences all gamepads at once
 static void ov_vib_permit(Cpu *c) {
     int on = (arg_x(c, 0) & 0xff) != 0;
+    uint64_t now = kern_now_ns();
     plat_mutex_lock(&vib_lock);
     vib_allowed = on;
-    rumble_update(kern_now_ns());
+    for (int p = 0; p < INPUT_MAX_PLAYERS; p++) rumble_update_player(p, now);
     plat_mutex_unlock(&vib_lock);
     ret_x(c, 0);
 }
 
-static volatile int32_t six_running;   // StartSixAxisSensor .. StopSixAxisSensor
+static volatile int32_t six_running[INPUT_MAX_PLAYERS];   // StartSixAxisSensor .. StopSixAxisSensor per player
 
-static int six_axis_ours(const uint32_t *h, const char *fn) {
-    uint32_t v = *need_handle(h, fn);
-    if ((v & 0xff) == pad_style_index() && (v >> 8 & 0xff) == pad_id() && (v >> 16 & 0xff) == SIX_AXIS_DEVICE) return 1;
+static int six_axis_slot(const uint32_t *h, const char *fn) {
+    uint32_t v = *need_handle(h, fn), sidx = v & 0xff, id = (v >> 8) & 0xff, dev = (v >> 16) & 0xff;
+    uint32_t pstyle = 0;
+    int slot = npad_slot_for_id(id, &pstyle);
+    uint32_t expect_idx = pstyle == STYLE_HANDHELD ? STYLE_INDEX_HANDHELD : STYLE_INDEX_FULL_KEY;
+    if (slot >= 0 && sidx == expect_idx && dev == SIX_AXIS_DEVICE) return slot;
     static volatile int32_t warned;
-    once(&warned, "hid: six-axis call for handle %#x, not the connected controller's sensor: reads at rest", v);
-    return 0;
+    once(&warned, "hid: six-axis call for handle %#x, not a connected controller's sensor: reads at rest", v);
+    return -1;
 }
 
 // Result detail::StartSixAxisSensor(const SixAxisSensorHandle &): angle and direction start over
 static void ov_six_start(Cpu *c) {
     const uint32_t *h = arg_p(c, 0);
-    if (six_axis_ours(h, "StartSixAxisSensor")) {
-        static volatile int32_t logged;
-        once(&logged, "hid: the game started the six-axis sensor (handle %#x)", *h);
-        motion_restart(motion_global());
+    int slot = six_axis_slot(h, "StartSixAxisSensor");
+    if (slot >= 0) {
+        static volatile int32_t logged[INPUT_MAX_PLAYERS];
+        once(&logged[slot], "hid: the game started the six-axis sensor (handle %#x)", *h);
+        motion_restart(motion_player(slot));
         input_motion_start();
-        plat_xchg32(&six_running, 1);
+        plat_xchg32(&six_running[slot], 1);
     }
     ret_x(c, 0);
 }
 
 // Result detail::StopSixAxisSensor(const SixAxisSensorHandle &)
 static void ov_six_stop(Cpu *c) {
-    if (six_axis_ours(arg_p(c, 0), "StopSixAxisSensor")) plat_xchg32(&six_running, 0);
+    int slot = six_axis_slot(arg_p(c, 0), "StopSixAxisSensor");
+    if (slot >= 0) plat_xchg32(&six_running[slot], 0);
     ret_x(c, 0);
 }
 
@@ -497,15 +587,16 @@ static void ov_six_stop(Cpu *c) {
 static int six_fill(MotionState *s, int max, const uint32_t *h, const char *fn) {
     if (max <= 0) return 0;
     if (!s) rt_fatal("nn::hid::detail::%s: null output", fn);
-    int live = six_axis_ours(h, fn) && six_running && input_motion_enabled();
-    int n = live ? motion_read(motion_global(), s, max, kern_now_ns()) : 0;
+    int slot = six_axis_slot(h, fn);
+    int live = slot >= 0 && six_running[slot] && input_motion_enabled();
+    int n = live ? motion_read(motion_player(slot), s, max, kern_now_ns()) : 0;
     if (!n) {
         static const MotionState rest = {.acc = {0, 0, -1}, .dir = {1, 0, 0, 0, 1, 0, 0, 0, 1}};
         for (int i = 0; i < max; i++) s[i] = rest;
     } else
         for (int i = n; i < max; i++) s[i] = s[n - 1];
     static volatile int32_t first_rest, first_live;
-    if (!n && six_running) once(&first_rest, "hid: six-axis read with no motion samples: at rest (%u states)", (uint32_t)max);
+    if (!n && slot >= 0 && six_running[slot]) once(&first_rest, "hid: six-axis read with no motion samples: at rest (%u states)", (uint32_t)max);
     if (n) once(&first_live, "hid: first six-axis read with live motion (%u samples)", (uint32_t)n);
     return max;
 }
@@ -694,9 +785,12 @@ HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", ov_state
 HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", ov_states_joycon);
 HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", ov_states_handheld);
 HOST_OVERRIDE("_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE", ov_hold_type);
+HOST_OVERRIDE("_ZN2nn3hid18GetNpadJoyHoldTypeEv", ov_get_hold_type);
 HOST_OVERRIDE("_ZN2nn3hid14DisconnectNpadERKj", ov_disconnect);
 HOST_OVERRIDE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE",
               ov_controller_support);
+HOST_OVERRIDE("_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE",
+              ov_controller_support_no_out);
 HOST_OVERRIDE("_ZN2nn3hid15InitializeMouseEv", ov_initialize_mouse);
 HOST_OVERRIDE("_ZN2nn3hid18InitializeKeyboardEv", ov_initialize_keyboard);
 HOST_OVERRIDE("_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi", ov_mouse_states);

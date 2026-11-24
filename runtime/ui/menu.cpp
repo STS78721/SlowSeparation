@@ -1327,10 +1327,17 @@ static void perf_full_draw(const MenuTarget *t, float scale) {
     }
     perf_picture(t, pic_c);
     const char *pname = input_gamepad_name();
+    int pcnt = input_pad_count();
     if (pname) {
         int pct = -1, chg = 0;
         int hp = input_pad_power_info(&pct, &chg);
-        if (hp && pct >= 0) {
+        if (pcnt > 1) {
+            if (hp && pct >= 0) {
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1), "[Controllers: %d] P1: %s [%s %d%%]", pcnt, pname, chg ? "Charging" : "Battery", pct);
+            } else {
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1), "[Controllers: %d] P1: %s", pcnt, pname);
+            }
+        } else if (hp && pct >= 0) {
             ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1), "[Controller] %s [%s %d%%]", pname, chg ? "Charging" : "Battery", pct);
         } else {
             ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1), "[Controller] %s", pname);

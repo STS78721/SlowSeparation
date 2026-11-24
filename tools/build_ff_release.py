@@ -69,7 +69,7 @@ def read_version() -> str:
     if p.is_file():
         # utf-8-sig drops a PowerShell/Notepad BOM that would poison package filenames.
         return p.read_text(encoding="utf-8-sig").strip().splitlines()[0].strip()
-    return "Alpha 0.1.2c"
+    return "Alpha 0.1.2d"
 
 
 def version_slug(ver: str) -> str:
